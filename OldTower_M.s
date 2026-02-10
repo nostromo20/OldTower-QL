@@ -805,25 +805,25 @@ clear_title_message_area:
         moveq   #7,d1                   ; 8 rows
 
 .ctma_row:
-        move.l  d0,(a1)
-        move.l  d0,4(a1)
-        move.l  d0,8(a1)
-        move.l  d0,12(a1)
-        move.l  d0,16(a1)
-        move.l  d0,20(a1)
-        move.l  d0,24(a1)
-        move.l  d0,28(a1)
-        move.l  d0,32(a1)
-        move.l  d0,36(a1)
-        move.l  d0,40(a1)
-        move.l  d0,44(a1)
-        move.l  d0,48(a1)
-        move.l  d0,52(a1)
-        move.l  d0,56(a1)
-        move.l  d0,60(a1)
-        move.l  d0,64(a1)
-        move.l  d0,68(a1)
-        adda.w  #SCREEN_STRIDE,a1
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        adda.w  #SCREEN_STRIDE-72,a1
         dbra    d1,.ctma_row
 
         movem.l (sp)+,d0-d1/a1
@@ -1189,17 +1189,17 @@ clear_message_area:
         moveq   #7,d1                   ; 8 rows
 
 .cma_row:
-        move.l  d0,(a1)
-        move.l  d0,4(a1)
-        move.l  d0,8(a1)
-        move.l  d0,12(a1)
-        move.l  d0,16(a1)
-        move.l  d0,20(a1)
-        move.l  d0,24(a1)
-        move.l  d0,28(a1)
-        move.l  d0,32(a1)
-        move.l  d0,36(a1)
-        adda.w  #SCREEN_STRIDE,a1
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        adda.w  #SCREEN_STRIDE-40,a1
         dbra    d1,.cma_row
 
         movem.l (sp)+,d0-d1/a1
@@ -1306,8 +1306,6 @@ outro_str_musician:
         dc.b    13,6,17,8,18,8,12,8,17,$FF       ; "O NIKITIN"
 outro_str_artist:
         dc.b    8,6,3,2,14,2,23,17,2,24,$FF      ; "I SELEZNEV"
-outro_str_pushfire:
-        dc.b    0,10,3,11,6,7,8,1,2,$FF          ; "PUSH FIRE"
         even
 
 ; ============================================================
@@ -4247,27 +4245,15 @@ render_playfield_to_buffer:
         lea     (a3),a1
         adda.w  d1,a1           ; a1 = expanded tile source
 
-        ; Get buffer destination for this tile
-        move.l  a0,-(sp)        ; Save buffer row ptr
-
-        ; Copy 8 rows of tile to buffer
+        ; Copy 8 rows of tile to buffer (displacement from fixed a0)
         move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #BUF_STRIDE,a0
-        move.l  (a1)+,(a0)
-
-        move.l  (sp)+,a0        ; Restore buffer row ptr
+        move.l  (a1)+,BUF_STRIDE(a0)
+        move.l  (a1)+,BUF_STRIDE*2(a0)
+        move.l  (a1)+,BUF_STRIDE*3(a0)
+        move.l  (a1)+,BUF_STRIDE*4(a0)
+        move.l  (a1)+,BUF_STRIDE*5(a0)
+        move.l  (a1)+,BUF_STRIDE*6(a0)
+        move.l  (a1)+,BUF_STRIDE*7(a0)
         addq.l  #4,a0           ; Next tile column in buffer
 
         dbra    d5,.col_loop
@@ -4841,25 +4827,25 @@ draw_outro_thanks:
         moveq   #0,d0
         moveq   #7,d1
 .otf_clr_row:
-        move.l  d0,(a1)
-        move.l  d0,4(a1)
-        move.l  d0,8(a1)
-        move.l  d0,12(a1)
-        move.l  d0,16(a1)
-        move.l  d0,20(a1)
-        move.l  d0,24(a1)
-        move.l  d0,28(a1)
-        move.l  d0,32(a1)
-        move.l  d0,36(a1)
-        move.l  d0,40(a1)
-        move.l  d0,44(a1)
-        move.l  d0,48(a1)
-        move.l  d0,52(a1)
-        move.l  d0,56(a1)
-        move.l  d0,60(a1)
-        move.l  d0,64(a1)
-        move.l  d0,68(a1)
-        adda.w  #SCREEN_STRIDE,a1
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        move.l  d0,(a1)+
+        adda.w  #SCREEN_STRIDE-72,a1
         dbra    d1,.otf_clr_row
 
 .otf_done:
@@ -4939,84 +4925,6 @@ draw_bullets_to_screen:
 .done_pop:
         movem.l (sp)+,d0-d4/a0-a1
 .done:
-        rts
-
-; ============================================================
-; draw_enemies_to_screen - Draw all enemies directly to screen
-; No buffer save/restore - clean buffer copy each frame erases old positions
-; ============================================================
-draw_enemies_to_screen:
-        move.w  num_enemies(pc),d0
-        beq     .ene_done
-
-        movem.l d0-d7/a0-a2,-(sp)
-
-        move.w  window_y(pc),d6         ; d6 = window_y (preserved)
-        lea     enemy_slots(pc),a1
-        moveq   #MAX_ENEMIES-1,d5
-
-.ene_loop:
-        tst.w   (a1)                    ; Check active
-        beq     .ene_next
-
-        ; Get position
-        move.w  2(a1),d0                ; d0 = tile X
-        move.w  4(a1),d1                ; d1 = tile Y
-
-        ; Check visibility
-        move.w  d1,d2
-        lsl.w   #3,d2                   ; d2 = tile_y * 8
-        sub.w   d6,d2                   ; d2 = screen_pixel_y
-        bmi     .ene_next               ; Above visible
-        cmpi.w  #VIEW_HEIGHT_PX-7,d2
-        bgt     .ene_next               ; Below visible
-
-        ; Calculate screen address
-        ; screen_addr = PLAYFIELD_BASE + screen_y * 128 + tile_x * 4
-        move.w  d2,d3
-        lsl.w   #7,d3                   ; d3 = screen_y * 128
-        move.w  d0,d4
-        lsl.w   #2,d4                   ; d4 = tile_x * 4
-        add.w   d4,d3
-        lea     PLAYFIELD_BASE,a0
-        adda.w  d3,a0                   ; a0 = screen address
-
-        ; Get sprite address
-        bsr     get_enemy_sprite        ; Returns a4 = sprite address
-
-        ; Draw enemy (8 rows × 8 bytes = 2 tiles wide)
-        ; Use SCREEN_STRIDE (128) between rows
-        movem.l (a4)+,d0-d1             ; 8 bytes
-        move.l  d0,(a0)
-        move.l  d1,4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE(a0)
-        move.l  d1,SCREEN_STRIDE+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*2(a0)
-        move.l  d1,SCREEN_STRIDE*2+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*3(a0)
-        move.l  d1,SCREEN_STRIDE*3+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*4(a0)
-        move.l  d1,SCREEN_STRIDE*4+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*5(a0)
-        move.l  d1,SCREEN_STRIDE*5+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*6(a0)
-        move.l  d1,SCREEN_STRIDE*6+4(a0)
-        movem.l (a4)+,d0-d1
-        move.l  d0,SCREEN_STRIDE*7(a0)
-        move.l  d1,SCREEN_STRIDE*7+4(a0)
-
-.ene_next:
-        adda.w  #ENEMY_SLOT_SIZE,a1
-        dbra    d5,.ene_loop
-
-        movem.l (sp)+,d0-d7/a0-a2
-.ene_done:
         rts
 
 ; ============================================================
@@ -5706,55 +5614,44 @@ composite_enemies_to_buffer:
         ; Save buffer address for restore
         move.l  a0,(a2)
 
-        ; FIX: Save background - avoid d5 (loop counter)
-        ; Use d0-d4,d6-d7,a4 for 8 longwords
-        ; Load rows 0-3 from buffer, store to save area
-        move.l  (a0),d0
-        move.l  4(a0),d1
-        move.l  BUF_STRIDE(a0),d2
-        move.l  BUF_STRIDE+4(a0),d3
-        move.l  BUF_STRIDE*2(a0),d4
-        move.l  BUF_STRIDE*2+4(a0),d6       ; Skip d5!
-        move.l  BUF_STRIDE*3(a0),d7
-        move.l  BUF_STRIDE*3+4(a0),a4
-        movem.l d0-d4/d6-d7/a4,(a3)
-        lea     32(a3),a3
-        ; Load rows 4-7
-        move.l  BUF_STRIDE*4(a0),d0
-        move.l  BUF_STRIDE*4+4(a0),d1
-        move.l  BUF_STRIDE*5(a0),d2
-        move.l  BUF_STRIDE*5+4(a0),d3
-        move.l  BUF_STRIDE*6(a0),d4
-        move.l  BUF_STRIDE*6+4(a0),d6       ; Skip d5!
-        move.l  BUF_STRIDE*7(a0),d7
-        move.l  BUF_STRIDE*7+4(a0),a4
-        movem.l d0-d4/d6-d7/a4,(a3)
-        lea     32(a3),a3
+        ; Save background (direct memory-to-memory, no register intermediary)
+        move.l  (a0),(a3)+
+        move.l  4(a0),(a3)+
+        move.l  BUF_STRIDE(a0),(a3)+
+        move.l  BUF_STRIDE+4(a0),(a3)+
+        move.l  BUF_STRIDE*2(a0),(a3)+
+        move.l  BUF_STRIDE*2+4(a0),(a3)+
+        move.l  BUF_STRIDE*3(a0),(a3)+
+        move.l  BUF_STRIDE*3+4(a0),(a3)+
+        move.l  BUF_STRIDE*4(a0),(a3)+
+        move.l  BUF_STRIDE*4+4(a0),(a3)+
+        move.l  BUF_STRIDE*5(a0),(a3)+
+        move.l  BUF_STRIDE*5+4(a0),(a3)+
+        move.l  BUF_STRIDE*6(a0),(a3)+
+        move.l  BUF_STRIDE*6+4(a0),(a3)+
+        move.l  BUF_STRIDE*7(a0),(a3)+
+        move.l  BUF_STRIDE*7+4(a0),(a3)+
 
         ; Get sprite address based on direction and frame
         bsr     get_enemy_sprite        ; Returns a4 = sprite address
 
-        ; FIX: Draw sprite - avoid d5 (loop counter)
-        ; Use d0-d4,d6-d7,a5 for 8 longwords
-        movem.l (a4)+,d0-d4/d6-d7/a5        ; Skip d5!
-        move.l  d0,(a0)
-        move.l  d1,4(a0)
-        move.l  d2,BUF_STRIDE(a0)
-        move.l  d3,BUF_STRIDE+4(a0)
-        move.l  d4,BUF_STRIDE*2(a0)
-        move.l  d6,BUF_STRIDE*2+4(a0)       ; d6 not d5
-        move.l  d7,BUF_STRIDE*3(a0)
-        move.l  a5,BUF_STRIDE*3+4(a0)
-        ; Load rows 4-7 from sprite
-        movem.l (a4)+,d0-d4/d6-d7/a5        ; Skip d5!
-        move.l  d0,BUF_STRIDE*4(a0)
-        move.l  d1,BUF_STRIDE*4+4(a0)
-        move.l  d2,BUF_STRIDE*5(a0)
-        move.l  d3,BUF_STRIDE*5+4(a0)
-        move.l  d4,BUF_STRIDE*6(a0)
-        move.l  d6,BUF_STRIDE*6+4(a0)       ; d6 not d5
-        move.l  d7,BUF_STRIDE*7(a0)
-        move.l  a5,BUF_STRIDE*7+4(a0)
+        ; Draw sprite (direct memory-to-memory, no register intermediary)
+        move.l  (a4)+,(a0)
+        move.l  (a4)+,4(a0)
+        move.l  (a4)+,BUF_STRIDE(a0)
+        move.l  (a4)+,BUF_STRIDE+4(a0)
+        move.l  (a4)+,BUF_STRIDE*2(a0)
+        move.l  (a4)+,BUF_STRIDE*2+4(a0)
+        move.l  (a4)+,BUF_STRIDE*3(a0)
+        move.l  (a4)+,BUF_STRIDE*3+4(a0)
+        move.l  (a4)+,BUF_STRIDE*4(a0)
+        move.l  (a4)+,BUF_STRIDE*4+4(a0)
+        move.l  (a4)+,BUF_STRIDE*5(a0)
+        move.l  (a4)+,BUF_STRIDE*5+4(a0)
+        move.l  (a4)+,BUF_STRIDE*6(a0)
+        move.l  (a4)+,BUF_STRIDE*6+4(a0)
+        move.l  (a4)+,BUF_STRIDE*7(a0)
+        move.l  (a4)+,BUF_STRIDE*7+4(a0)
         bra.s   .next_comp2
 
 .next_comp:
@@ -5788,27 +5685,23 @@ restore_buffer_under_enemies:
         move.l  a0,d0
         beq.s   .skip_restore           ; No enemy was composited here
 
-        ; OPT: Restore background using movem.l for contiguous reads
-        ; Load rows 0-3 from save area (contiguous)
-        movem.l (a2)+,d2-d7/a3/a4       ; 8 longwords
-        move.l  d2,(a0)
-        move.l  d3,4(a0)
-        move.l  d4,BUF_STRIDE(a0)
-        move.l  d5,BUF_STRIDE+4(a0)
-        move.l  d6,BUF_STRIDE*2(a0)
-        move.l  d7,BUF_STRIDE*2+4(a0)
-        move.l  a3,BUF_STRIDE*3(a0)
-        move.l  a4,BUF_STRIDE*3+4(a0)
-        ; Load rows 4-7 from save area
-        movem.l (a2)+,d2-d7/a3/a4
-        move.l  d2,BUF_STRIDE*4(a0)
-        move.l  d3,BUF_STRIDE*4+4(a0)
-        move.l  d4,BUF_STRIDE*5(a0)
-        move.l  d5,BUF_STRIDE*5+4(a0)
-        move.l  d6,BUF_STRIDE*6(a0)
-        move.l  d7,BUF_STRIDE*6+4(a0)
-        move.l  a3,BUF_STRIDE*7(a0)
-        move.l  a4,BUF_STRIDE*7+4(a0)
+        ; Restore background (direct memory-to-memory, no register intermediary)
+        move.l  (a2)+,(a0)
+        move.l  (a2)+,4(a0)
+        move.l  (a2)+,BUF_STRIDE(a0)
+        move.l  (a2)+,BUF_STRIDE+4(a0)
+        move.l  (a2)+,BUF_STRIDE*2(a0)
+        move.l  (a2)+,BUF_STRIDE*2+4(a0)
+        move.l  (a2)+,BUF_STRIDE*3(a0)
+        move.l  (a2)+,BUF_STRIDE*3+4(a0)
+        move.l  (a2)+,BUF_STRIDE*4(a0)
+        move.l  (a2)+,BUF_STRIDE*4+4(a0)
+        move.l  (a2)+,BUF_STRIDE*5(a0)
+        move.l  (a2)+,BUF_STRIDE*5+4(a0)
+        move.l  (a2)+,BUF_STRIDE*6(a0)
+        move.l  (a2)+,BUF_STRIDE*6+4(a0)
+        move.l  (a2)+,BUF_STRIDE*7(a0)
+        move.l  (a2)+,BUF_STRIDE*7+4(a0)
         bra.s   .next_rest
 
 .skip_restore:
@@ -6292,27 +6185,6 @@ get_tile_addr:
         adda.w  d0,a0
         rts
 
-; ============================================================
-; draw_hero_smart
-; ============================================================
-draw_hero_smart:
-        move.w  hero_x(pc),d0
-        cmp.w   hero_drawn_x(pc),d0
-        bne.s   draw_hero_force
-        move.w  hero_y(pc),d0
-        cmp.w   hero_drawn_y(pc),d0
-        bne.s   draw_hero_force
-        move.w  anim_frame(pc),d0
-        cmp.w   hero_drawn_anim(pc),d0
-        bne.s   draw_hero_force
-        move.w  hero_fly(pc),d0
-        cmp.w   hero_drawn_fly(pc),d0
-        bne.s   draw_hero_force
-        move.w  window_y(pc),d0
-        cmp.w   hero_drawn_scroll(pc),d0
-        bne.s   draw_hero_force
-        rts
-
 draw_hero_force:
         movem.l d0-d2/a0-a1,-(sp)
 
@@ -6372,81 +6244,6 @@ draw_hero_force:
 
 .done:
         movem.l (sp)+,d0-d2/a0-a1
-        rts
-
-; ============================================================
-; redraw_tile_at - Redraw tile at level position (x,y)
-; Input: d0 = x (level coord 0-11)
-;        d1 = y (level coord 0-63)
-; ============================================================
-redraw_tile_at:
-        movem.l d0-d5/a0-a2,-(sp)
-
-        ; Bounds check
-        tst.w   d0
-        bmi     .done
-        cmpi.w  #LEVEL_W,d0
-        bge     .done
-        tst.w   d1
-        bmi     .done
-        cmpi.w  #LEVEL_H,d1
-        bge     .done
-
-        ; Save level coordinates
-        move.w  d0,d3           ; d3 = level_x
-        move.w  d1,d4           ; d4 = level_y
-
-        ; Check if visible on screen (pixel-based)
-        ; screen_pixel_y = level_y * 8 - window_y
-        move.w  d4,d2
-        lsl.w   #3,d2           ; d2 = level_y * 8
-        sub.w   window_y(pc),d2 ; d2 = screen_pixel_y
-        bmi     .done           ; Above visible area
-        cmpi.w  #VIEW_HEIGHT_PX-7,d2
-        bgt     .done           ; Below visible area
-        lsr.w   #3,d2           ; d2 = screen_tile_y
-
-        ; Calculate offset: y * 12 + x using shift-add
-        move.w  d4,d0           ; d0 = y
-        add.w   d0,d0           ; d0 = y*2
-        add.w   d4,d0           ; d0 = y*3
-        lsl.w   #2,d0           ; d0 = y*12
-        add.w   d3,d0           ; d0 = y*12 + x
-
-        ; Get tile type from level_data
-        move.l  level_data_ptr(pc),a0
-        moveq   #0,d5
-        move.b  (a0,d0.w),d5    ; d5 = tile type
-
-        ; Get expanded tile data
-        lsl.w   #5,d5
-        lea     expanded_tiles(pc),a1
-        adda.w  d5,a1           ; a1 = expanded tile
-
-        ; Get screen address
-        move.w  d3,d0           ; d0 = level_x (= screen_x)
-        move.w  d2,d1           ; d1 = screen_y
-        bsr     get_tile_addr   ; a0 = screen address
-
-        ; Draw tile
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-        adda.w  #SCREEN_STRIDE,a0
-        move.l  (a1)+,(a0)
-
-.done:
-        movem.l (sp)+,d0-d5/a0-a2
         rts
 
 ; ============================================================
