@@ -1,9 +1,10 @@
 ; ============================================================
-; Old Tower - 128KB Edition (QDOS Executable)
+; Old Tower v1.2 - 128KB Edition (QDOS Executable)
 ; ============================================================
 ; QDOS executable version - run with EXEC_W or EX command.
 ; Sound effects via QSound or IPC beeper fallback.
-; Memory: ~56KB. No SuperBASIC loader required.
+; Direct AY hardware writes with period scaling.
+; 25Hz decimated AFX sound effects.
 ; ============================================================
 ; Levels: 00 (title), 01-15 and 21-25 (21 levels total)
 ; Press SPACE to swap between heroes (or advance when level won)
@@ -459,6 +460,9 @@ init_title_screen:
 
         ; Draw the "OLD TOWER" logo
         bsr     draw_title_logo
+
+        ; Draw "v1.2" version text at bottom-left
+        bsr     draw_version
 
         ; Draw lives
         bsr     draw_lives
@@ -2237,6 +2241,32 @@ draw_score:
         rts
 
 ; ============================================================
+; draw_version - Blit "v1.2" bitmap at bottom-left of intro screen
+; 15px wide (4 words) x 4 rows, pre-rendered Mode 8 white pixels.
+; Called once from init_title_screen.
+; ============================================================
+draw_version:
+        movem.l d0/a0-a1,-(sp)
+        lea     SCREEN_BASE+(251*SCREEN_STRIDE)+2,a1  ; bottom-left
+        lea     ver_bitmap(pc),a0
+        moveq   #3,d0                   ; 4 rows
+.vblit: move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        lea     SCREEN_STRIDE-8(a1),a1  ; next scanline
+        dbra    d0,.vblit
+        movem.l (sp)+,d0/a0-a1
+        rts
+
+; Pre-rendered Mode 8 bitmap: "v1.2" 15px x 4 rows, white on black
+ver_bitmap:
+        dc.w    $2233,$080C,$0A0F,$80C0  ; .#.#..#...###.
+        dc.w    $2233,$080C,$0000,$80C0  ; .#.#..#.......
+        dc.w    $2A3F,$080C,$0203,$0000  ; .###..#....#..
+        dc.w    $080C,$080C,$8ACF,$80C0  ; ..#...#.#.###.
+
+; ============================================================
 ; wait_vsync with 25fps frame pacing (debug/timing code removed)
 ; Two modes - adaptive (default) or forced 25fps
 ; Waits until 2 ticks have elapsed since previous frame end.
@@ -2255,8 +2285,9 @@ wait_vsync:
 
 ; --- Adaptive mode: wait until 2 ticks elapsed ---
 wait_vsync_adaptive:
-        movem.l d0/a0,-(sp)
-        move.w  $2802E,d0
+        movem.l d0/a0-a1,-(sp)
+        movea.l tick_counter_ptr(pc),a1
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         bge.s   .a_overrun
@@ -2264,7 +2295,7 @@ wait_vsync_adaptive:
         lea     frame_overrun(pc),a0
         clr.w   (a0)
 .a_wait:
-        move.w  $2802E,d0
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         blt.s   .a_wait
@@ -2279,13 +2310,14 @@ wait_vsync_adaptive:
         add.w   prev_tick(pc),d0
         lea     prev_tick(pc),a0
         move.w  d0,(a0)
-        movem.l (sp)+,d0/a0
+        movem.l (sp)+,d0/a0-a1
         rts
 
 ; --- Forced 25fps mode: wait for 2 tick boundaries ---
 wait_vsync_forced:
-        movem.l d0/a0,-(sp)
-        move.w  $2802E,d0
+        movem.l d0/a0-a1,-(sp)
+        movea.l tick_counter_ptr(pc),a1
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         bge.s   .f_overrun
@@ -2296,19 +2328,19 @@ wait_vsync_forced:
         lea     frame_overrun(pc),a0
         move.w  #1,(a0)
 .f_wait1:
-        move.w  $2802E,d0
+        move.w  (a1),d0
 .f_spin1:
-        cmp.w   $2802E,d0
+        cmp.w   (a1),d0
         beq.s   .f_spin1
-        move.w  $2802E,d0
+        move.w  (a1),d0
 .f_spin2:
-        cmp.w   $2802E,d0
+        cmp.w   (a1),d0
         beq.s   .f_spin2
 
-        move.w  $2802E,d0
+        move.w  (a1),d0
         lea     prev_tick(pc),a0
         move.w  d0,(a0)
-        movem.l (sp)+,d0/a0
+        movem.l (sp)+,d0/a0-a1
         rts
 
 ; ============================================================
@@ -7477,6 +7509,9 @@ prev_lives:      dc.w -1            ; Previous lives value for caching (-1 = for
 death_anim_count: dc.w 0            ; Death animation frame counter
 death_screen_ptr: dc.l 0            ; Screen address for death sprite
 
+; Cached tick counter pointer (set by qsound_init from sys vars + $2E)
+tick_counter_ptr: dc.l $2802E       ; Pointer to QDOS tick counter
+
 ; Frame drop detection
 prev_tick:       dc.w 0             ; Previous frame's tick counter value
 
@@ -7689,9 +7724,9 @@ afx_bank_ptr:      dc.l 0
 ; Cached AY.JMP dispatch vector (set during qsound_init)
 ay_jmp_vector:     dc.l 0
 
-; --- Sound bank data (513 bytes, 9 effects) ---
+; --- Sound bank data (25Hz decimated, 302 bytes, 9 effects) ---
 sound_bank:
-        incbin  "tomba.afb"
+        incbin  "tomba_25hz.afb"
         even
 
 ; ============================================================
@@ -7706,6 +7741,17 @@ qsound_init:
         ; Get system variables base via MT.INF
         moveq   #0,d0
         trap    #1                      ; MT.INF: a0 = sys vars base
+
+        ; Cache tick counter address (sys vars base + $2E)
+        lea     tick_counter_ptr(pc),a1
+        lea     $2E(a0),a2
+        move.l  a2,(a1)
+
+        ; Sync prev_tick to current system tick (one-time).
+        ; Prevents wait_vsync from seeing a huge elapsed count on first call.
+        move.w  (a2),d0
+        lea     prev_tick(pc),a1
+        move.w  d0,(a1)
 
         ; Check if QSound vector is installed at SV.AYJMP ($164)
         move.l  $164(a0),d0
@@ -7729,11 +7775,31 @@ qsound_init:
         ; Initialize AFX player (even if no hardware — just sets up data)
         bsr     afx_init
 
-        ; Only silence AY if in vector mode
+        ; Only init/silence AY if in vector mode
         move.w  qsound_mode(pc),d0
         cmpi.w  #QSND_VECTOR,d0
         bne.s   .skip_silence
-        bsr     ay_silence
+        ; Call AY.INIT (function 0) to reset QSound driver state
+        ; Fixes first-run hang on fresh boot
+        move.l  ay_jmp_vector(pc),a0
+        moveq   #0,d0                  ; Function 0 = AY.INIT
+        jsr     (a0)
+        ; Initial silence via ROM dispatch (AY.WRALL function 3).
+        ; Don't use ay_silence here — it calls ay_write_all which does
+        ; direct port writes. On first boot the QSound hardware may not
+        ; be ready for direct access yet. Let the ROM handle it.
+        lea     ay_regs(pc),a0
+        moveq   #AY_NUM_REGS-1,d0
+.clr_init:
+        clr.b   (a0)+
+        dbra    d0,.clr_init
+        lea     ay_regs+7(pc),a0
+        move.b  #$3F,(a0)
+        move.l  ay_jmp_vector(pc),a0
+        lea     ay_regs(pc),a1
+        moveq   #3,d0                  ; Function 3 = AY.WRALL
+        moveq   #0,d2                  ; Chip ID = 0
+        jsr     (a0)
 .skip_silence:
 
         movem.l (sp)+,d0-d2/a0-a2
@@ -7943,21 +8009,145 @@ sfx_frame:
         rts
 
 ; ============================================================
-; ay_write_all - Write 14 AY registers via QSound ROM vector
-; Calls AY.WRALL (function 3) through SV.AYJMP dispatch.
-; Works on both real QSound hardware and QPC2 emulation.
+; ay_write_all - Write AY registers via direct hardware ports
+; Bypasses QSound ROM dispatch for lower latency.
+; Reordered: amplitudes first, tones/noise, envelope, mixer last.
+; Calls scale_periods to convert Spectrum AY clock to QSound clock.
 ; ============================================================
+; QSound AY port addresses:
+;   $000C2000 = data bus (register number or value)
+;   $000C2002 = control port (bus mode: BDIR/BC1/BC2)
+;   $0F = LATCH ADDRESS (BC1=1, BDIR=1)
+;   $0E = WRITE DATA   (BC1=0, BDIR=1)
+;   $0A = INACTIVE     (BC1=0, BDIR=0)
+; ============================================================
+AY_DATA_PORT    equ $000C2000
+AY_CTRL_PORT    equ $000C2002
+
+; Macro for writing one AY register
+        macro   AY_WRITE_REG
+        moveq   #\1,d2
+        move.b  d2,(a5)                 ; register number to data bus
+        move.b  d1,(a6)                 ; LATCH ADDRESS
+        move.b  d0,(a6)                 ; INACTIVE
+        move.b  \2(a0),(a5)             ; value from ay_regs buffer
+        move.b  d3,(a6)                 ; WRITE DATA
+        move.b  d0,(a6)                 ; INACTIVE
+        endm
+
 ay_write_all:
-        movem.l d0-d2/a0-a2/a5,-(sp)
+        movem.l d0-d3/a0/a5-a6,-(sp)
         move.w  qsound_mode(pc),d0
         cmpi.w  #QSND_VECTOR,d0
-        bne.s   .done
-        move.l  ay_jmp_vector(pc),a0   ; Cached SV.AYJMP dispatch
-        lea     ay_regs(pc),a1         ; 14-byte register buffer
-        moveq   #3,d0                  ; Function 3 = AY.WRALL
-        moveq   #0,d2                  ; Chip ID = 0
-        jsr     (a0)                   ; Call QSound dispatch
-.done:  movem.l (sp)+,d0-d2/a0-a2/a5
+        bne     .done
+        bsr     scale_periods          ; Spectrum 1.77MHz -> QSound 750kHz
+
+        ; Reordered register write
+        lea     ay_regs(pc),a0
+        lea     AY_DATA_PORT,a5
+        lea     AY_CTRL_PORT,a6
+        moveq   #$0A,d0                 ; INACTIVE
+        moveq   #$0F,d1                 ; LATCH ADDRESS
+        moveq   #$0E,d3                 ; WRITE DATA
+
+        ; Phase 1: Amplitudes (regs 8, 9, 10)
+        AY_WRITE_REG 8,8
+        AY_WRITE_REG 9,9
+        AY_WRITE_REG 10,10
+
+        ; Phase 2: Tone periods (regs 0-5) and noise (reg 6)
+        AY_WRITE_REG 0,0
+        AY_WRITE_REG 1,1
+        AY_WRITE_REG 2,2
+        AY_WRITE_REG 3,3
+        AY_WRITE_REG 4,4
+        AY_WRITE_REG 5,5
+        AY_WRITE_REG 6,6
+
+        ; Phase 3: Envelope (regs 11, 12, 13)
+        AY_WRITE_REG 11,11
+        AY_WRITE_REG 12,12
+        AY_WRITE_REG 13,13
+
+        ; Phase 4: Mixer LAST (reg 7)
+        AY_WRITE_REG 7,7
+
+.done:  movem.l (sp)+,d0-d3/a0/a5-a6
+        rts
+
+; ============================================================
+; scale_periods - Scale tone/noise/envelope periods for QSound clock
+;
+; AFX data was composed for the ZX Spectrum AY clock (1.7734 MHz).
+; The QSound AY hardware clock is 750 kHz (QL 15MHz master / 20).
+;
+; Scaling factor: 750,000 / 1,773,400 = 27/64 = 0.421875
+; (exact ratio is 0.42288, error < 0.25%)
+;
+; Modifies ay_regs in place. Clobbers d0 only.
+; ============================================================
+scale_periods:
+        lea     ay_regs(pc),a0
+
+        ; --- Tone A (regs 0-1, 12-bit period) ---
+        moveq   #0,d0
+        move.b  1(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  0(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,0(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,1(a0)
+
+        ; --- Tone B (regs 2-3) ---
+        moveq   #0,d0
+        move.b  3(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  2(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,2(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,3(a0)
+
+        ; --- Tone C (regs 4-5) ---
+        moveq   #0,d0
+        move.b  5(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  4(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,4(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,5(a0)
+
+        ; --- Noise (reg 6, 5-bit period) ---
+        moveq   #0,d0
+        move.b  6(a0),d0
+        andi.w  #$1F,d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        andi.b  #$1F,d0
+        move.b  d0,6(a0)
+
+        ; --- Envelope (regs 11-12, 16-bit period) ---
+        moveq   #0,d0
+        move.b  12(a0),d0
+        lsl.w   #8,d0
+        move.b  11(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,11(a0)
+        lsr.w   #8,d0
+        move.b  d0,12(a0)
+
         rts
 
 ; ============================================================

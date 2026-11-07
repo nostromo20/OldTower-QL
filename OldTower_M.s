@@ -1,10 +1,11 @@
 ; ============================================================
-; Old Tower - Music Edition (QDOS Executable)
+; Old Tower v1.2 - Music Edition (QDOS Executable)
 ; ============================================================
 ; QDOS executable version - run with EXEC_W or EX command.
 ; Full audio: QSound music + SFX, or IPC beeper fallback.
-; Memory: ~110KB. Requires 128KB QL or expanded system.
-; Music uses TBK compression, mixed with AFX sound effects.
+; Music uses 25Hz TBK v2 compression (replay back-references),
+; mixed with 25Hz AFX sound effects. Direct AY hardware writes.
+;   - reg13_dirty cleared ONCE before decode.
 ; ============================================================
 ; Levels: 00 (title), 01-15 and 21-25 (21 levels total)
 ; Press SPACE to swap between heroes (or advance when level won)
@@ -268,8 +269,17 @@ start_game:
         adda.l  #music_to_play,a0
         move.w  #MUSIC_LEVEL1,(a0)
 
+        ; Process track change immediately — silence AY before heavy load
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         ; Load first level
         bsr     load_current_level
+
+        ; Audio update after level decompress
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     cache_coin_positions        ; Cache coin positions for fast animation
         bsr     cache_exit_positions        ; Cache exit positions for animation
 
@@ -317,8 +327,22 @@ start_game:
         lea     game_state(pc),a0
         move.w  #GS_GAMEPLAY,(a0)
 
+        ; Reset to adaptive frame pacing (title may have enabled forced mode)
+        lea     frame_pacer_mode(pc),a0
+        clr.w   (a0)
+
         bsr     clear_trails
+
+        ; Audio update after level setup
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     render_playfield_to_buffer  ; Render level to off-screen buffer
+
+        ; Audio update after render
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     copy_window_to_screen       ; Copy visible portion to screen
         bsr     draw_scrolling_columns      ; Draw side columns
         bsr     draw_hero_force
@@ -336,6 +360,10 @@ start_game:
         lea     prev_score(pc),a0
         move.l  #-1,(a0)                    ; Force redraw
         bsr     draw_score
+
+        ; Final audio catch-up
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
 
 main_loop:
         ; Clear flags
@@ -420,12 +448,21 @@ init_title_screen:
         adda.l  #music_to_play,a0
         move.w  #MUSIC_MENU,(a0)
 
+        ; Process track change immediately — silence AY before heavy load
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         ; Initialize level 0 (title/menu level)
         lea     current_level(pc),a0
         clr.w   (a0)
 
         ; Load title level
         bsr     load_current_level
+
+        ; Audio update after level decompress
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     cache_coin_positions
         bsr     cache_exit_positions
 
@@ -468,20 +505,42 @@ init_title_screen:
         lea     title_flash_ctr(pc),a0
         move.w  #TITLE_FLASH_RATE,(a0)
 
+        ; Disable pacer sampling (title loop is lightweight,
+        ; adaptive mode paces correctly at 25fps without forced mode)
+        lea     title_pacer_count(pc),a0
+        move.w  #PACER_SKIP+PACER_SAMPLES,(a0)
+
         ; Flush keyboard buffer to prevent immediate key detection
         bsr     flush_keyboard
 
         bsr     clear_trails
+
+        ; Audio update after level setup
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     render_playfield_to_buffer
+
+        ; Audio update after render
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     copy_window_to_screen
         bsr     draw_scrolling_columns
 
         ; Draw the "OLD TOWER" logo
         bsr     draw_title_logo
 
+        ; Draw version string on title screen
+        bsr     draw_version
+
         ; Draw lives
         bsr     draw_lives
         bsr     draw_score                  ; Draw score on title
+
+        ; Final audio catch-up
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
 
         rts
 
@@ -499,20 +558,16 @@ title_loop:
         bsr     update_coin_animation
         bsr     update_exit_animation
 
-        ; Composite and draw (trails into buffer for no flicker)
-        bsr     composite_trails_to_buffer
-        bsr     composite_enemies_to_buffer
-        bsr     composite_hero_to_buffer
+        ; --- Direct-to-screen rendering (no composite/copy/restore) ---
 
-        ; Use title-specific copy that skips logo area (no flicker)
-        bsr     copy_window_to_screen_title
+        ; 1. Erase hero at current screen position (restore from buffer)
+        bsr     title_erase_hero
 
-        ; Columns are static - no redraw needed
+        ; 2. Draw hero at current position directly to screen
+        bsr     draw_hero_force
 
-        ; Restore buffer
-        bsr     restore_buffer_under_hero
-        bsr     restore_buffer_under_enemies
-        bsr     restore_buffer_under_trails
+        ; 3. Blit coin tiles from buffer to screen (cheap: 2 tiles)
+        bsr     title_blit_coins_to_screen
 
         ; Update logo colors (cycling) and redraw
         bsr     cycle_logo_colors
@@ -546,6 +601,161 @@ title_loop:
         bra     start_game
 
 ; Outro routines moved near buffer code (see after copy_window_to_screen_title)
+
+; ============================================================
+; title_erase_hero - Restore hero tile from buffer to screen
+; Uses hero_x/hero_y and window_y to compute screen address,
+; then copies the tile from the playfield buffer to screen.
+; ============================================================
+title_erase_hero:
+        movem.l d0-d1/a0-a1,-(sp)
+
+        ; Calculate screen position
+        move.w  hero_y(pc),d0
+        lsl.w   #3,d0               ; d0 = hero_y * 8 (pixel)
+        sub.w   window_y(pc),d0     ; d0 = screen_pixel_y
+        bmi.s   .te_done            ; Off screen
+        cmpi.w  #VIEW_HEIGHT_PX-7,d0
+        bgt.s   .te_done
+
+        ; Screen dest = PLAYFIELD_BASE + screen_pixel_y * SCREEN_STRIDE + hero_x * 4
+        move.w  d0,d1
+        lsl.w   #7,d1               ; d1 = screen_pixel_y * 128
+        move.w  hero_x(pc),d0
+        lsl.w   #2,d0               ; d0 = hero_x * 4
+        add.w   d0,d1
+        lea     PLAYFIELD_BASE,a1
+        adda.w  d1,a1               ; a1 = screen address
+
+        ; Buffer source = playfield_buf + hero_y * 384 + hero_x * 4
+        move.w  hero_y(pc),d0
+        move.w  d0,d1
+        lsl.w   #8,d1               ; d1 = hero_y * 256
+        lsl.w   #7,d0               ; d0 = hero_y * 128
+        add.w   d1,d0               ; d0 = hero_y * 384
+        move.w  hero_x(pc),d1
+        lsl.w   #2,d1
+        add.w   d1,d0
+        lea     playfield_buf(pc),a0
+        adda.w  d0,a0               ; a0 = buffer address
+
+        ; Copy 8 rows (buffer stride 48, screen stride 128)
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+
+.te_done:
+        movem.l (sp)+,d0-d1/a0-a1
+        rts
+
+; ============================================================
+; title_blit_coins_to_screen - Copy coin tiles from buffer to screen
+; Iterates cached coin positions and blits each from buffer to screen.
+; ============================================================
+title_blit_coins_to_screen:
+        movem.l d0-d5/a0-a3,-(sp)
+
+        move.w  num_cached_coins(pc),d5
+        beq     .tbc_done
+        subq.w  #1,d5
+        lea     coin_cache(pc),a3    ; a3 = coin cache pointer
+
+        ; Pre-compute visible tile range
+        move.w  window_y(pc),d3
+        lsr.w   #3,d3               ; d3 = first visible tile row
+        move.w  d3,d4
+        addi.w  #PLAY_H,d4          ; d4 = last visible tile row
+
+.tbc_loop:
+        move.b  (a3)+,d1             ; tile_y
+        move.b  (a3)+,d0             ; tile_x
+        cmpi.b  #$FF,d1
+        beq     .tbc_next            ; collected
+
+        ext.w   d1
+        cmp.w   d3,d1
+        blt     .tbc_next            ; not visible
+        cmp.w   d4,d1
+        bge     .tbc_next
+
+        ext.w   d0
+
+        ; --- Buffer source: playfield_buf + tile_y * 384 + tile_x * 4 ---
+        move.w  d1,d2
+        move.w  d1,d0               ; save tile_y
+        move.w  d2,d1
+        lsl.w   #8,d1               ; d1 = tile_y * 256
+        lsl.w   #7,d2               ; d2 = tile_y * 128
+        add.w   d1,d2               ; d2 = tile_y * 384
+        move.b  -1(a3),d1           ; reload tile_x from cache
+        ext.w   d1
+        move.w  d1,d0               ; d0 = tile_x (save for screen)
+        lsl.w   #2,d1               ; d1 = tile_x * 4
+        add.w   d1,d2
+        lea     playfield_buf(pc),a0
+        adda.w  d2,a0               ; a0 = buffer source
+
+        ; --- Screen dest: PLAYFIELD_BASE + screen_pixel_y * 128 + tile_x * 4 ---
+        move.b  -2(a3),d2           ; reload tile_y from cache
+        ext.w   d2
+        lsl.w   #3,d2               ; d2 = tile_y * 8
+        sub.w   window_y(pc),d2     ; d2 = screen_pixel_y
+        lsl.w   #7,d2               ; d2 = screen_pixel_y * 128
+        move.w  d0,d1
+        lsl.w   #2,d1               ; d1 = tile_x * 4
+        add.w   d1,d2
+        lea     PLAYFIELD_BASE,a1
+        adda.w  d2,a1               ; a1 = screen dest
+
+        ; Copy 8 rows (buffer stride 48, screen stride 128)
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+        adda.w  #BUF_STRIDE,a0
+        adda.w  #SCREEN_STRIDE,a1
+        move.l  (a0),(a1)
+
+.tbc_next:
+        dbra    d5,.tbc_loop
+
+.tbc_done:
+        movem.l (sp)+,d0-d5/a0-a3
+        rts
 
 ; Pacer sampling constants and variables (near title_loop for bsr range)
 PACER_SKIP      equ 8                   ; Skip first N frames (warm-up)
@@ -1421,7 +1631,16 @@ handle_reset_level:
 ; Called by handle_death and handle_reset_level.
 ; ============================================================
 full_restart_level:
+        ; Audio update before heavy load (keeps music flowing)
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     load_current_level
+
+        ; Audio update after level decompress
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     cache_coin_positions
         bsr     cache_exit_positions
         bsr     find_hero_start
@@ -1429,6 +1648,10 @@ full_restart_level:
         bsr     build_cannon_list
         bsr     init_scroll
         bsr     clear_trails
+
+        ; Audio update after level setup
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
 
         ; Reset hero state
         lea     hero_dir(pc),a0
@@ -1446,11 +1669,21 @@ full_restart_level:
 
         ; Re-render level
         bsr     render_playfield_to_buffer
+
+        ; Audio update after render
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     copy_window_to_screen
         bsr     draw_scrolling_columns
         bsr     draw_hero_force
         ; Removed draw_level_num
         bsr     draw_lives
+
+        ; Final audio catch-up
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         rts
 
 ; ============================================================
@@ -1983,9 +2216,18 @@ next_level:
 .music1:
         move.w  #MUSIC_LEVEL1,(a0)
 .music_done:
+        ; Process track change immediately — silence AY before heavy load
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         lea     current_level(pc),a0    ; Restore a0 for load_current_level
 
         bsr     load_current_level
+
+        ; Audio update after level decompress
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     cache_coin_positions        ; Cache coin positions for fast animation
         bsr     cache_exit_positions        ; Cache exit positions for animation
         bsr     find_hero_start
@@ -1993,7 +2235,17 @@ next_level:
         bsr     build_cannon_list           ; Build cannon list and clear bullets
         bsr     init_scroll
         bsr     clear_trails
+
+        ; Audio update after level setup
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     render_playfield_to_buffer  ; Render new level to buffer
+
+        ; Audio update after render (heaviest operation)
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
+
         bsr     copy_window_to_screen       ; Copy visible portion to screen
         bsr     draw_scrolling_columns      ; Draw animated side columns
 
@@ -2015,6 +2267,10 @@ next_level:
         ; Removed draw_level_num
         bsr     draw_lives                  ; Draw lives HUD
         bsr     draw_score                  ; Draw score on new level
+
+        ; Final audio catch-up
+        movea.l sfx_update_ptr(pc),a6
+        jsr     (a6)
 
         movem.l (sp)+,d0/a0
         rts
@@ -2279,6 +2535,32 @@ draw_score:
         rts
 
 ; ============================================================
+; draw_version - Blit "v1.2" bitmap at bottom-left of intro screen
+; 15px wide (4 words) x 4 rows, pre-rendered Mode 8 white pixels.
+; Called once from init_title_screen.
+; ============================================================
+draw_version:
+        movem.l d0/a0-a1,-(sp)
+        lea     SCREEN_BASE+(251*SCREEN_STRIDE)+2,a1  ; bottom-left
+        lea     ver_bitmap(pc),a0
+        moveq   #3,d0                   ; 4 rows
+.vblit: move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        lea     SCREEN_STRIDE-8(a1),a1  ; next scanline
+        dbra    d0,.vblit
+        movem.l (sp)+,d0/a0-a1
+        rts
+
+; Pre-rendered Mode 8 bitmap: "v1.2" 15px x 4 rows, white on black
+ver_bitmap:
+        dc.w    $2233,$080C,$0A0F,$80C0  ; .#.#..#...###.
+        dc.w    $2233,$080C,$0000,$80C0  ; .#.#..#.......
+        dc.w    $2A3F,$080C,$0203,$0000  ; .###..#....#..
+        dc.w    $080C,$080C,$8ACF,$80C0  ; ..#...#.#.###.
+
+; ============================================================
 ; wait_vsync with 25fps frame pacing (debug/timing code removed)
 ; Two modes - adaptive (default) or forced 25fps
 ; Waits until 2 ticks have elapsed since previous frame end.
@@ -2297,8 +2579,9 @@ wait_vsync:
 
 ; --- Adaptive mode: wait until 2 ticks elapsed ---
 wait_vsync_adaptive:
-        movem.l d0/a0,-(sp)
-        move.w  $2802E,d0
+        movem.l d0/a0-a1,-(sp)
+        movea.l tick_counter_ptr(pc),a1
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         bge.s   .a_overrun
@@ -2306,7 +2589,7 @@ wait_vsync_adaptive:
         lea     frame_overrun(pc),a0
         clr.w   (a0)
 .a_wait:
-        move.w  $2802E,d0
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         blt.s   .a_wait
@@ -2321,13 +2604,14 @@ wait_vsync_adaptive:
         add.w   prev_tick(pc),d0
         lea     prev_tick(pc),a0
         move.w  d0,(a0)
-        movem.l (sp)+,d0/a0
+        movem.l (sp)+,d0/a0-a1
         rts
 
 ; --- Forced 25fps mode: wait for 2 tick boundaries ---
 wait_vsync_forced:
-        movem.l d0/a0,-(sp)
-        move.w  $2802E,d0
+        movem.l d0/a0-a1,-(sp)
+        movea.l tick_counter_ptr(pc),a1
+        move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         bge.s   .f_overrun
@@ -2338,19 +2622,19 @@ wait_vsync_forced:
         lea     frame_overrun(pc),a0
         move.w  #1,(a0)
 .f_wait1:
-        move.w  $2802E,d0
+        move.w  (a1),d0
 .f_spin1:
-        cmp.w   $2802E,d0
+        cmp.w   (a1),d0
         beq.s   .f_spin1
-        move.w  $2802E,d0
+        move.w  (a1),d0
 .f_spin2:
-        cmp.w   $2802E,d0
+        cmp.w   (a1),d0
         beq.s   .f_spin2
 
-        move.w  $2802E,d0
+        move.w  (a1),d0
         lea     prev_tick(pc),a0
         move.w  d0,(a0)
-        movem.l (sp)+,d0/a0
+        movem.l (sp)+,d0/a0-a1
         rts
 
 ; ============================================================
@@ -7533,6 +7817,9 @@ frame_pacer_mode: dc.w 0
 ; Frame overrun flag (for pacer sampling without red pixel)
 frame_overrun:   dc.w 0
 
+; Cached tick counter pointer (set by qsound_init from sys vars + $2E)
+tick_counter_ptr: dc.l $2802E       ; Pointer to QDOS tick counter
+
 ; QSound SFX function pointers (set by sfx_setup_ptrs at startup)
 sfx_update_ptr:    dc.l 0           ; Absolute address of sfx_update
 qsound_init_ptr:   dc.l 0           ; Absolute address of qsound_init
@@ -7734,12 +8021,23 @@ music_playing:     dc.w 0          ; 1 = music active, 0 = silent
 current_music_id:  dc.w 255        ; Currently loaded track ID
                    even
 
+; reg13_dirty: set by psg_frame when TBK updates register 13.
+; ay_write_all only writes reg13 to hardware when this is non-zero.
+reg13_dirty:       dc.w 0          ; Non-zero = TBK updated reg 13 this frame
+prev_audio_tick:   dc.w 0          ; Tick counter at last audio update
+
 ; TBK decompression state
 tbk_buffer:        ds.b 16         ; Unpacked register frame (16 bytes)
 tbk_stream:        dc.l 0          ; Current position in packed data stream
 tbk_prev:          dc.l 0          ; Saved return position (for replay commands)
 tbk_loop_addr:     dc.l 0          ; Start of packed data (for track looping)
 tbk_pausing:       dc.w 0          ; Pause frames remaining (0=not pausing)
+
+; Replay stack for nested TBK replay commands (4 levels x 8 bytes)
+REPLAY_STACK_MAX equ 4
+replay_stack:       ds.b REPLAY_STACK_MAX*8
+replay_stack_depth: dc.w 0
+                    even
 
 ; AFX channel data (3 channels x 8 bytes = 24 bytes)
 afx_ch_data:       ds.b AFX_NUM_CH*AFX_CH_SIZE
@@ -7752,9 +8050,9 @@ afx_bank_ptr:      dc.l 0
 ; Cached AY.JMP dispatch vector (set during qsound_init)
 ay_jmp_vector:     dc.l 0
 
-; --- Sound bank data (513 bytes, 9 effects) ---
+; --- Sound bank data (25Hz decimated, 302 bytes, 9 effects) ---
 sound_bank:
-        incbin  "tomba.afb"
+        incbin  "tomba_25hz.afb"
         even
 
 ; ============================================================
@@ -7769,6 +8067,18 @@ qsound_init:
         ; Get system variables base via MT.INF
         moveq   #0,d0
         trap    #1                      ; MT.INF: a0 = sys vars base
+
+        ; Cache tick counter address (sys vars base + $2E)
+        lea     tick_counter_ptr(pc),a1
+        lea     $2E(a0),a2
+        move.l  a2,(a1)
+
+        ; Sync prev_audio_tick to current system tick (one-time).
+        ; Prevents audio_update from seeing a huge elapsed count on
+        ; the very first call (before any track is started).
+        move.w  (a2),d0
+        lea     prev_audio_tick(pc),a1
+        move.w  d0,(a1)
 
         ; Check if QSound vector is installed at SV.AYJMP ($164)
         move.l  $164(a0),d0
@@ -7792,11 +8102,30 @@ qsound_init:
         ; Initialize AFX player (even if no hardware — just sets up data)
         bsr     afx_init
 
-        ; Only silence AY if in vector mode
+        ; Only init/silence AY if in vector mode
         move.w  qsound_mode(pc),d0
         cmpi.w  #QSND_VECTOR,d0
         bne.s   .skip_silence
-        bsr     ay_silence
+        ; Call AY.INIT (function 0) to reset QSound driver state
+        move.l  ay_jmp_vector(pc),a0
+        moveq   #0,d0                  ; Function 0 = AY.INIT
+        jsr     (a0)
+        ; Initial silence via ROM dispatch (AY.WRALL function 3).
+        ; Don't use ay_silence here — it calls ay_write_all which does
+        ; direct port writes. On first boot the QSound hardware may not
+        ; be ready for direct access yet. Let the ROM handle it.
+        lea     ay_regs(pc),a0
+        moveq   #AY_NUM_REGS-1,d0
+.clr_init:
+        clr.b   (a0)+
+        dbra    d0,.clr_init
+        lea     ay_regs+7(pc),a0
+        move.b  #$3F,(a0)
+        move.l  ay_jmp_vector(pc),a0
+        lea     ay_regs(pc),a1
+        moveq   #3,d0                  ; Function 3 = AY.WRALL
+        moveq   #0,d2                  ; Chip ID = 0
+        jsr     (a0)
 .skip_silence:
 
         movem.l (sp)+,d0-d2/a0-a2
@@ -7867,219 +8196,169 @@ sfx_play:
         rts
 
 ; ============================================================
-; sfx_update - Per-frame sound update (Music + SFX)
-; Full audio with TBK music and AFX effects via amplitude mixing
+; sfx_update / audio_update - 25Hz fixed-rate audio update
+; Decodes 1 TBK frame per call, mixes with SFX, writes to AY.
+; reg13_dirty cleared once before decode — preserves envelope
+; writes from any frame.
 ; ============================================================
 sfx_update:
+audio_update:
         move.w  qsound_mode(pc),d0
-        beq     .done                   ; QSND_NONE
+        beq     .au_done                ; QSND_NONE
         cmpi.w  #QSND_BEEPER,d0
-        beq     .beeper_path
+        beq     .au_beeper
 
-        ; --- QSound path (QSND_VECTOR) with Music ---
+        ; --- QSound path ---
 
-        ; Music track switching (once per game frame)
+        ; 1. Track change check
         lea     music_to_play(pc),a0
         move.w  (a0),d0
         cmpi.w  #MUSIC_NONE,d0
-        beq.s   .no_track_change
+        beq.s   .au_no_track
         cmp.w   current_music_id(pc),d0
-        beq.s   .clear_music_queue      ; Already playing this track
-        bsr     psg_init                ; D0 = track ID
-.clear_music_queue:
+        beq.s   .au_clear_track
+        bsr     psg_init
+        ; Write silence to AY immediately on track change,
+        ; skip frame decode this call to give a clean 1-frame gap.
+        ; Force reg13_dirty so ay_write_all resets the envelope generator.
+        lea     reg13_dirty(pc),a0
+        move.w  #1,(a0)
         lea     music_to_play(pc),a0
         move.w  #MUSIC_NONE,(a0)
-.no_track_change:
+        bsr     ay_write_all            ; flush silence to hardware
+        bra.s   .au_done
+.au_clear_track:
+        lea     music_to_play(pc),a0
+        move.w  #MUSIC_NONE,(a0)
+.au_no_track:
 
-        ; SFX queue (once per game frame)
+        ; 2. SFX trigger check
         lea     sound_to_play(pc),a0
         move.w  (a0),d0
         cmpi.w  #SFX_NONE,d0
-        beq.s   .no_new_sfx
+        beq.s   .au_no_sfx
         bsr     sfx_play
+        lea     sound_to_play(pc),a0
         move.w  #SFX_NONE,(a0)
-.no_new_sfx:
+.au_no_sfx:
 
-        ; === Audio Frame 1 ===
-        ; Music frame
+        ; 3. Decode 1 frame of 25Hz music (fixed-rate, no tick counter)
         move.w  music_playing(pc),d0
-        beq.s   .no_music_f1
+        beq.s   .au_no_music
+
+        ; Clear reg13_dirty before decode
+        lea     reg13_dirty(pc),a0
+        clr.w   (a0)
+
         bsr     psg_frame
-.no_music_f1:
-        ; Copy music_regs to ay_regs (base layer)
+
+.au_no_music:
+        ; 4. Copy music_regs to ay_regs
         lea     music_regs(pc),a0
         lea     ay_regs(pc),a1
         move.l  (a0)+,(a1)+             ; regs 0-3
         move.l  (a0)+,(a1)+             ; regs 4-7
         move.l  (a0)+,(a1)+             ; regs 8-11
         move.w  (a0)+,(a1)+             ; regs 12-13
-        ; SFX overlay (amplitude priority mixing)
-        bsr     sfx_frame_overlay
-        ; Output to hardware
+
+        ; 5. SFX overlay: advance once, overlay once
+        bsr     sfx_tick_advance
+        bsr     sfx_apply_overlay
+
+        ; 6. Write to AY hardware
         bsr     ay_write_all
 
-        ; === Audio Frame 2 (25fps mode only) ===
-        ; In forced 25fps mode, music was composed for 50fps so we need
-        ; to advance and output a second audio frame per game tick
-        move.w  frame_pacer_mode(pc),d0
-        beq.s   .audio_done             ; 0 = adaptive 50fps, skip 2nd frame
-        ; Music frame 2
-        move.w  music_playing(pc),d0
-        beq.s   .no_music_f2
-        bsr     psg_frame
-.no_music_f2:
-        ; Copy music_regs to ay_regs (base layer)
-        lea     music_regs(pc),a0
-        lea     ay_regs(pc),a1
-        move.l  (a0)+,(a1)+             ; regs 0-3
-        move.l  (a0)+,(a1)+             ; regs 4-7
-        move.l  (a0)+,(a1)+             ; regs 8-11
-        move.w  (a0)+,(a1)+             ; regs 12-13
-        ; SFX overlay (amplitude priority mixing)
-        bsr     sfx_frame_overlay
-        ; Output to hardware
-        bsr     ay_write_all
-.audio_done:
+.au_done:
         rts
 
-        ; --- IPC beeper path (no music support) ---
-.beeper_path:
+        ; --- IPC beeper path ---
+.au_beeper:
         lea     sound_to_play(pc),a0
         move.w  (a0),d0
         cmpi.w  #SFX_NONE,d0
-        beq.s   .done
+        beq.s   .au_done
         move.w  #SFX_NONE,(a0)          ; Clear before call
         bsr     beeper_play_sfx
-.done:  rts
+        bra.s   .au_done
 
 ; ============================================================
-; sfx_frame_overlay - Process AFX channels, overlay on music
-; Amplitude-priority mixing - SFX overrides music when louder
-; Music values already in ay_regs from psg_frame; only override
-; when SFX amplitude >= music amplitude for each channel.
+; SFX processing: split into advance + overlay (channel B only).
+;
+; sfx_tick_advance  - Advance SFX data pointer by one frame.
+;                     Updates channel state (amp, tone, noise, mixer bits)
+;                     but does NOT modify ay_regs.
+;
+; sfx_apply_overlay - Apply current SFX channel state onto ay_regs.
+;                     Does NOT advance. Channel-B only. SFX overrides
+;                     music channel B only when SFX amplitude is
+;                     STRICTLY GREATER than music amplitude.
+;                     75% SFX volume (value - value/4).
+;                     Shared noise protection: when SFX uses noise on B,
+;                     disable noise on channels A and C in the mixer.
 ; ============================================================
-sfx_frame_overlay:
-        movem.l d0-d5/a0-a3,-(sp)
 
-        ; Process all 3 channels into afx_ch_data (advance effect data)
-        ; Then overlay onto ay_regs using amplitude priority
-
-        ; Start with SFX mixer = all off ($3F = all tone+noise disabled)
-        moveq   #$3F,d4
-        ; d5 = accumulated SFX noise period
-        moveq   #0,d5
-        lea     ay_regs(pc),a3
-
-        ; --- Process Channel A ---
-        lea     afx_ch_data(pc),a0
-        bsr     .process_channel
-        ; Channel A mixer bits: info bit4→mixer bit0 (tone), bit7→bit3 (noise)
-        move.b  5(a0),d0
-        lsr.b   #4,d0                  ; bit4→bit0, bit7→bit3
-        andi.b  #$09,d0                ; keep bits 0 and 3 only
-        andi.b  #$F6,d4                ; clear chA bits in mixer
-        or.b    d0,d4                  ; merge
-        ; Amplitude priority: compare SFX vs music
-        move.b  4(a0),d0               ; SFX amplitude
-        andi.b  #$0F,d0                ; mask to 4 bits
-        move.b  8(a3),d1               ; Music amplitude (already in ay_regs)
-        andi.b  #$0F,d1
-        cmp.b   d1,d0
-        bcs.s   .skip_a                ; SFX < music → skip
-        ; SFX wins: override ay_regs
-        move.b  4(a0),8(a3)            ; AmplA
-        move.b  6(a0),0(a3)            ; TonA_lo
-        move.b  7(a0),1(a3)            ; TonA_hi
-        ; Override mixer bits for channel A
-        move.b  7(a3),d1               ; current ay_regs mixer
-        andi.b  #$F6,d1                ; clear chA bits
-        move.b  5(a0),d0
-        lsr.b   #4,d0
-        andi.b  #$09,d0
-        or.b    d0,d1
-        move.b  d1,7(a3)
-        ; Check if SFX has noise update
-        btst    #7,5(a0)               ; noise enable bit in SFX info
-        beq.s   .skip_a
-        lea     afx_noise_period(pc),a2
-        move.b  (a2),d5                ; capture noise period
-.skip_a:
-
-        ; --- Process Channel B ---
+; --- sfx_tick_advance: advance SFX state by one frame ---
+sfx_tick_advance:
+        movem.l d0-d2/a0-a2,-(sp)
         lea     afx_ch_data+AFX_CH_SIZE(pc),a0
-        bsr     .process_channel
-        ; Channel B mixer bits: info bit4→mixer bit1, bit7→bit4
-        move.b  5(a0),d0
-        lsr.b   #3,d0
-        andi.b  #$12,d0
-        andi.b  #$ED,d4
-        or.b    d0,d4
-        ; Amplitude priority
-        move.b  4(a0),d0
-        andi.b  #$0F,d0
-        move.b  9(a3),d1
-        andi.b  #$0F,d1
-        cmp.b   d1,d0
-        bcs.s   .skip_b
-        move.b  4(a0),9(a3)            ; AmplB
-        move.b  6(a0),2(a3)            ; TonB_lo
-        move.b  7(a0),3(a3)            ; TonB_hi
-        move.b  7(a3),d1
-        andi.b  #$ED,d1
-        move.b  5(a0),d0
-        lsr.b   #3,d0
-        andi.b  #$12,d0
-        or.b    d0,d1
-        move.b  d1,7(a3)
-        btst    #7,5(a0)
-        beq.s   .skip_b
-        lea     afx_noise_period(pc),a2
-        move.b  (a2),d5
-.skip_b:
-
-        ; --- Process Channel C ---
-        lea     afx_ch_data+AFX_CH_SIZE*2(pc),a0
-        bsr     .process_channel
-        ; Channel C mixer bits: info bit4→mixer bit2, bit7→bit5
-        move.b  5(a0),d0
-        lsr.b   #2,d0
-        andi.b  #$24,d0
-        andi.b  #$DB,d4
-        or.b    d0,d4
-        ; Amplitude priority
-        move.b  4(a0),d0
-        andi.b  #$0F,d0
-        move.b  10(a3),d1
-        andi.b  #$0F,d1
-        cmp.b   d1,d0
-        bcs.s   .skip_c
-        move.b  4(a0),10(a3)           ; AmplC
-        move.b  6(a0),4(a3)            ; TonC_lo
-        move.b  7(a0),5(a3)            ; TonC_hi
-        move.b  7(a3),d1
-        andi.b  #$DB,d1
-        move.b  5(a0),d0
-        lsr.b   #2,d0
-        andi.b  #$24,d0
-        or.b    d0,d1
-        move.b  d1,7(a3)
-        btst    #7,5(a0)
-        beq.s   .skip_c
-        lea     afx_noise_period(pc),a2
-        move.b  (a2),d5
-.skip_c:
-
-        ; If any SFX channel had noise, override noise period
-        tst.b   d5
-        beq.s   .no_sfx_noise
-        move.b  d5,6(a3)               ; Override noise period
-.no_sfx_noise:
-
-        movem.l (sp)+,d0-d5/a0-a3
+        bsr     sfx_process_channel
+        movem.l (sp)+,d0-d2/a0-a2
         rts
 
-; --- Process single channel ---
-.process_channel:
+; --- sfx_apply_overlay: overlay current SFX state onto ay_regs ---
+sfx_apply_overlay:
+        movem.l d0-d2/a0-a3,-(sp)
+
+        lea     ay_regs(pc),a3
+        lea     afx_ch_data+AFX_CH_SIZE(pc),a0
+
+        ; Check if SFX channel B is active (amplitude > 0)
+        move.b  4(a0),d0               ; SFX amplitude
+        beq.s   .ov_done               ; SFX inactive or silent
+
+        ; If music uses envelope mode, music always wins
+        move.b  9(a3),d1               ; Music amplitude for ch B
+        btst    #4,d1                  ; Envelope mode?
+        bne.s   .ov_done               ; Yes → music always wins
+
+        ; Amplitude priority: SFX must be STRICTLY louder
+        ; 75% SFX amplitude
+        andi.b  #$0F,d0                ; mask SFX to 4 bits
+        move.b  d0,d2                  ; d2 = original value
+        lsr.b   #2,d2                  ; d2 = value/4
+        sub.b   d2,d0                  ; d0 = value - value/4 = 75%
+        beq.s   .ov_done               ; reduced to 0 → too quiet, skip
+        andi.b  #$0F,d1                ; mask music to 4 bits
+        cmp.b   d1,d0
+        bls.s   .ov_done               ; SFX <= music → music wins
+
+        ; SFX wins: override channel B in ay_regs
+        move.b  d0,9(a3)               ; AmplB (75% SFX amplitude)
+        move.b  6(a0),2(a3)            ; TonB_lo
+        move.b  7(a0),3(a3)            ; TonB_hi
+
+        ; Override mixer bits for channel B only (bits 1 and 4)
+        move.b  7(a3),d1               ; current ay_regs mixer
+        andi.b  #$ED,d1                ; clear ch B bits (1 and 4)
+        move.b  5(a0),d0               ; SFX info byte
+        lsr.b   #3,d0                  ; bit4→bit1, bit7→bit4
+        andi.b  #$12,d0                ; keep bits 1 and 4 only
+        or.b    d0,d1                  ; merge SFX mixer bits
+        move.b  d1,7(a3)               ; write back
+
+        ; If SFX has noise, override noise period AND protect music channels
+        btst    #7,5(a0)               ; noise enable bit in SFX info
+        beq.s   .ov_done
+        lea     afx_noise_period(pc),a2
+        move.b  (a2),6(a3)             ; Override noise period in ay_regs
+        ; Shared noise generator protection
+        ori.b   #$28,7(a3)             ; Disable noise on A (bit3) and C (bit5)
+.ov_done:
+        movem.l (sp)+,d0-d2/a0-a3
+        rts
+
+; --- Process single SFX channel (advance one frame) ---
+sfx_process_channel:
         move.l  (a0),d0
         beq.s   .ch_inactive
 
@@ -8121,21 +8400,154 @@ sfx_frame_overlay:
         rts
 
 ; ============================================================
-; ay_write_all - Write 14 AY registers via QSound ROM vector
-; Calls AY.WRALL (function 3) through SV.AYJMP dispatch.
-; Works on both real QSound hardware and QPC2 emulation.
+; ay_write_all - Write AY registers directly to hardware ports.
+;
+; Bypasses QSound ROM dispatch for lower latency.
+; Reordered: amplitudes first, tones/noise, envelope, mixer last.
+; Register 13 only written when reg13_dirty is set (avoids
+; restarting the envelope generator unnecessarily).
+;
+; QSound AY-3-8910 hardware interface:
+;   $000C2000 = data bus (register number or value)
+;   $000C2002 = control port (bus mode: BDIR/BC1/BC2)
+;   $0F = LATCH ADDRESS (BC1=1, BDIR=1)
+;   $0E = WRITE DATA   (BC1=0, BDIR=1)
+;   $0A = INACTIVE     (BC1=0, BDIR=0)
 ; ============================================================
+AY_DATA_PORT    equ $000C2000
+AY_CTRL_PORT    equ $000C2002
+
+; Macro for writing one AY register
+        macro   AY_WRITE_REG
+        moveq   #\1,d2
+        move.b  d2,(a5)                 ; register number to data bus
+        move.b  d1,(a6)                 ; LATCH ADDRESS
+        move.b  d0,(a6)                 ; INACTIVE
+        move.b  \2(a0),(a5)             ; value from ay_regs buffer
+        move.b  d3,(a6)                 ; WRITE DATA
+        move.b  d0,(a6)                 ; INACTIVE
+        endm
+
 ay_write_all:
-        movem.l d0-d2/a0-a2/a5,-(sp)
+        movem.l d0-d3/a0/a5-a6,-(sp)
         move.w  qsound_mode(pc),d0
         cmpi.w  #QSND_VECTOR,d0
-        bne.s   .done
-        move.l  ay_jmp_vector(pc),a0   ; Cached SV.AYJMP dispatch
-        lea     ay_regs(pc),a1         ; 14-byte register buffer
-        moveq   #3,d0                  ; Function 3 = AY.WRALL
-        moveq   #0,d2                  ; Chip ID = 0
-        jsr     (a0)                   ; Call QSound dispatch
-.done:  movem.l (sp)+,d0-d2/a0-a2/a5
+        bne     .done
+        bsr     scale_periods          ; Spectrum 1.77MHz -> QSound 750kHz
+
+        ; Reordered register write
+        lea     ay_regs(pc),a0
+        lea     AY_DATA_PORT,a5
+        lea     AY_CTRL_PORT,a6
+        moveq   #$0A,d0                 ; INACTIVE
+        moveq   #$0F,d1                 ; LATCH ADDRESS
+        moveq   #$0E,d3                 ; WRITE DATA
+
+        ; Phase 1: Amplitudes (regs 8, 9, 10)
+        AY_WRITE_REG 8,8
+        AY_WRITE_REG 9,9
+        AY_WRITE_REG 10,10
+
+        ; Phase 2: Tone periods (regs 0-5) and noise (reg 6)
+        AY_WRITE_REG 0,0
+        AY_WRITE_REG 1,1
+        AY_WRITE_REG 2,2
+        AY_WRITE_REG 3,3
+        AY_WRITE_REG 4,4
+        AY_WRITE_REG 5,5
+        AY_WRITE_REG 6,6
+
+        ; Phase 3: Envelope (regs 11, 12)
+        AY_WRITE_REG 11,11
+        AY_WRITE_REG 12,12
+
+        ; Phase 3b: Envelope shape (reg 13) - CONDITIONAL
+        ; On YM2149, writing register 13 RESTARTS the envelope generator.
+        ; Only write when TBK actually changed the value (reg13_dirty set).
+        move.w  reg13_dirty(pc),d2
+        beq.s   .skip_r13
+        AY_WRITE_REG 13,13
+.skip_r13:
+
+        ; Phase 4: Mixer LAST (reg 7)
+        AY_WRITE_REG 7,7
+
+.done:  movem.l (sp)+,d0-d3/a0/a5-a6
+        rts
+
+; ============================================================
+; scale_periods - Scale tone/noise/envelope periods for QSound clock
+;
+; TBK music was composed for the ZX Spectrum AY clock (1.7734 MHz).
+; The QSound AY hardware clock is 750 kHz (QL 15MHz master / 20).
+;
+; Scaling factor: 750,000 / 1,773,400 = 27/64 = 0.421875
+; (exact ratio is 0.42288, error < 0.25%)
+;
+; Modifies ay_regs in place. Clobbers d0 only.
+; ============================================================
+scale_periods:
+        lea     ay_regs(pc),a0
+
+        ; --- Tone A (regs 0-1, 12-bit period) ---
+        moveq   #0,d0
+        move.b  1(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  0(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,0(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,1(a0)
+
+        ; --- Tone B (regs 2-3) ---
+        moveq   #0,d0
+        move.b  3(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  2(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,2(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,3(a0)
+
+        ; --- Tone C (regs 4-5) ---
+        moveq   #0,d0
+        move.b  5(a0),d0
+        andi.w  #$0F,d0
+        lsl.w   #8,d0
+        move.b  4(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,4(a0)
+        lsr.w   #8,d0
+        andi.b  #$0F,d0
+        move.b  d0,5(a0)
+
+        ; --- Noise (reg 6, 5-bit period) ---
+        moveq   #0,d0
+        move.b  6(a0),d0
+        andi.w  #$1F,d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        andi.b  #$1F,d0
+        move.b  d0,6(a0)
+
+        ; --- Envelope (regs 11-12, 16-bit period) ---
+        moveq   #0,d0
+        move.b  12(a0),d0
+        lsl.w   #8,d0
+        move.b  11(a0),d0
+        mulu    #27,d0
+        lsr.l   #6,d0
+        move.b  d0,11(a0)
+        lsr.w   #8,d0
+        move.b  d0,12(a0)
+
         rts
 
 ; ============================================================
@@ -8369,6 +8781,10 @@ psg_init:
         lea     tbk_pausing(pc),a0
         clr.w   (a0)
 
+        ; Clear replay stack
+        lea     replay_stack_depth(pc),a0
+        clr.w   (a0)
+
         ; Clear music_regs to silence
         lea     music_regs(pc),a0
         moveq   #13,d0
@@ -8377,6 +8793,20 @@ psg_init:
         dbra    d0,.clr_regs
         lea     music_regs+7(pc),a0
         move.b  #$3F,(a0)               ; mixer = all disabled
+
+        ; Also clear ay_regs to prevent stale SFX overlay data
+        lea     ay_regs(pc),a0
+        moveq   #13,d0
+.clr_ay:
+        clr.b   (a0)+
+        dbra    d0,.clr_ay
+        lea     ay_regs+7(pc),a0
+        move.b  #$3F,(a0)               ; mixer = all disabled
+
+        ; Clear reg13_dirty so track switch doesn't cause
+        ; a spurious envelope restart from stale reg13 data
+        lea     reg13_dirty(pc),a0
+        clr.w   (a0)
 
         ; Set state
         lea     music_playing(pc),a1
@@ -8572,6 +9002,26 @@ psg_frame:
         lea     3(a0),a2               ; return address = after 3-byte command
 
 .do_replay:
+        ; If already inside a replay, push outer state to stack.
+        ; This handles nested replays (replay target contains another replay).
+        tst.b   15(a1)                  ; buffer[15] = current replay counter
+        beq.s   .replay_no_push         ; 0 = not inside a replay
+
+        ; Push (tbk_prev, buffer[15]) to replay stack
+        move.w  replay_stack_depth(pc),d4
+        cmpi.w  #REPLAY_STACK_MAX,d4
+        bge.s   .replay_no_push         ; stack full, skip (safety)
+        lea     replay_stack(pc),a3
+        lsl.w   #3,d4                   ; d4 = depth * 8 (entry size)
+        move.l  tbk_prev(pc),(a3,d4.w)  ; save outer prev_pos
+        moveq   #0,d5
+        move.b  15(a1),d5
+        move.w  d5,4(a3,d4.w)           ; save outer remaining count
+        ; Increment stack depth
+        lea     replay_stack_depth(pc),a3
+        addq.w  #1,(a3)
+
+.replay_no_push:
         ; Save return address
         lea     tbk_prev(pc),a3
         move.l  a2,(a3)
@@ -8586,7 +9036,7 @@ psg_frame:
         suba.l  d4,a3                  ; a3 = target address
         move.l  a3,a0                  ; read from target
 
-        ; Dispatch command at target (always a 0X command, not nested)
+        ; Dispatch command at target (may itself be a replay → nesting)
         bra     .tbk_dispatch
 
         ; ======== Frame done — bookkeeping ========
@@ -8608,7 +9058,13 @@ psg_frame:
         lea     tbk_stream(pc),a2
         move.l  a0,(a2)
 
+        ; Unwind replay stack (handle nested replays)
+        bsr     .replay_unwind
+
 .tbk_copy:
+        ; Sanitize mixer register (bits 7-6 must be 0)
+        andi.b  #$3F,7(a1)
+
         ; Copy tbk_buffer to music_regs
         lea     tbk_buffer(pc),a2
         lea     music_regs(pc),a3
@@ -8625,9 +9081,59 @@ psg_frame:
         cmpi.b  #$FF,d0
         beq.s   .pf_done
         move.b  14(a2),13(a3)          ; copy reg13 value
+        ; Flag reg 13 as needing a real hardware write this frame
+        lea     reg13_dirty(pc),a4
+        move.w  #1,(a4)
 
 .pf_done:
         movem.l (sp)+,d0-d5/a0-a4
+        rts
+
+; Unwind nested replay stack after a replay finishes.
+; Called from .tbk_frame_done when buffer[15] reaches 0.
+;
+; On entry: tbk_stream already contains restored prev_pos.
+; Modifies: d4, d5, a3 (saved/restored by psg_frame's movem).
+.replay_unwind:
+        move.w  replay_stack_depth(pc),d4
+        beq.s   .ru_done                ; stack empty, nothing to unwind
+
+.ru_loop:
+        ; Pop top entry: decrement depth
+        subq.w  #1,d4
+
+        ; Calculate entry byte offset = depth * 8
+        lea     replay_stack(pc),a3
+        move.w  d4,d5
+        lsl.w   #3,d5                   ; d5 = byte offset into stack
+
+        ; Read entry: +0 = outer_prev_pos (long), +4 = outer_remaining (word)
+        move.l  (a3,d5.w),a4           ; a4 = outer_prev_pos
+        move.w  4(a3,d5.w),d5         ; d5 = outer_remaining
+
+        ; This frame counted for the outer replay too
+        subq.w  #1,d5
+        ble.s   .ru_also_done           ; outer replay also finished (<=0)
+
+        ; outer_remaining > 0: restore as the active replay
+        lea     tbk_prev(pc),a3
+        move.l  a4,(a3)                ; tbk_prev = outer_prev_pos
+        lea     tbk_buffer(pc),a3
+        move.b  d5,15(a3)              ; buffer[15] = outer_remaining
+        bra.s   .ru_done               ; stop unwinding
+
+.ru_also_done:
+        ; Outer replay also exhausted: restore stream to its return address
+        lea     tbk_stream(pc),a3
+        move.l  a4,(a3)                ; tbk_stream = outer_prev_pos
+        ; Continue unwinding if more entries remain on stack
+        tst.w   d4
+        bgt.s   .ru_loop
+
+.ru_done:
+        ; Store updated stack depth
+        lea     replay_stack_depth(pc),a3
+        move.w  d4,(a3)
         rts
 
 ; ============================================================
@@ -8642,24 +9148,23 @@ music_track_ptrs:
         dc.l    track_outro
 
 ; ============================================================
-; Embedded Compressed Music Tracks (TBK/TPP format)
-; Total: ~49KB of compressed music data
+; Embedded 25Hz Music Tracks (decimated TBK v2, replay back-refs)
 ; ============================================================
         even
 track_menu:
-        incbin  "menu_psg_tpp"
+        incbin  "menu_25hz_mrg2_tpp"
         even
 track_level1:
-        incbin  "music01_psg_tpp"
+        incbin  "music01_25hz_mrg2_tpp"
         even
 track_level2:
-        incbin  "music02_psg_tpp"
+        incbin  "music02_25hz_mrg2_tpp"
         even
 track_level3:
-        incbin  "music03_psg_tpp"
+        incbin  "music03_25hz_mrg2_tpp"
         even
 track_outro:
-        incbin  "outro_psg_tpp"
+        incbin  "outro_25hz_mrg2_tpp"
         even
 
 ; ============================================================
