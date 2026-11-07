@@ -1,14 +1,15 @@
 ; ============================================================
-; Old Tower v1.2 - 128KB Edition (QDOS Executable)
+; Old Tower v2.0 - Sinclair QL, 128K
 ; ============================================================
-; QDOS executable version - run with EXEC_W or EX command.
+; Loaded by the SuperBASIC boot loader: RESPR + LBYTES + CALL.
+; Returns to BASIC (RTS) when the player quits from the title screen.
 ; Sound effects via QSound or IPC beeper fallback.
 ; Direct AY hardware writes with period scaling.
 ; 25Hz decimated AFX sound effects.
 ; ============================================================
 ; Levels: 00 (title), 01-15 and 21-25 (21 levels total)
 ; Press SPACE to swap between heroes (or advance when level won)
-; Press R to reset level, ESC to return to title (quit from title)
+; Press ENTER (or R in the QDOS build) to reset level, ESC to return to title (quit from title)
 ; ============================================================
 
 ; QDOS trap codes
@@ -110,6 +111,13 @@ QSND_NONE       equ 0           ; No sound hardware
 QSND_VECTOR     equ 1           ; QSound firmware API (SV.AYJMP)
 QSND_BEEPER     equ 3           ; IPC beeper fallback
 
+; Music track IDs (order of music_tracks in music_otz.inc)
+MUSIC_MENU      equ 0           ; Title screen
+MUSIC_LEVEL1    equ 1           ; Levels 1-10
+MUSIC_LEVEL2    equ 2           ; Levels 11-15
+MUSIC_LEVEL3    equ 3           ; Levels 16-20
+MUSIC_OUTRO     equ 4           ; Outro sequence
+
 ; IPC constants
 MT_IPCOM        equ $11         ; trap #1 function code
 IPC_CMD_SOUND   equ $0A         ; IPC sound command byte
@@ -176,7 +184,7 @@ CANNON_SIZE      equ 10              ; Total bytes per cannon record
 BULLET_ACTIVE    equ 0               ; 1 = active, 0 = inactive (word)
 BULLET_X         equ 2               ; Grid X position (word)
 BULLET_Y         equ 4               ; Grid Y position (word)
-BULLET_DIR       equ 6               ; Direction: DIR_LEFT or DIR_RIGHT (word)
+BULLET_DIR       equ 6               ; Direction: X delta -1 or +1 (word)
 BULLET_SIZE      equ 8               ; Total bytes per bullet record
 
 ; Hero slot structure offsets (18 bytes per hero)
@@ -215,14 +223,55 @@ GS_TITLE        equ 2           ; Title screen - waiting for fire
 GS_OUTRO        equ 3           ; Game complete outro screen
 
 ; Win state animation
-WIN_FLASH_RATE  equ 8           ; Flash "PRESS SPACE" every N frames
+WIN_FLASH_RATE  equ 8           ; Flash "PRESS FIRE" every N frames
 TITLE_FLASH_RATE equ 10         ; Flash "PUSH FIRE TO START" rate
 
 ; ============================================================
-; Entry - QDOS Job Entry Point
+; Entry point (CALL from SuperBASIC)
 ; ============================================================
+; ============================================================
+; POLLED mode (-DPOLLED=1): see ot_polled.s.  POLL counts a frame tick
+; if the frame interrupt flag is up; nothing between POLLs may take 20 ms.
+; ============================================================
+PC_IPCWR        equ     $18003
+PC_IPCRD        equ     $18020
+PC_INTR         equ     $18021
+PC_INTRF        equ     8               ; frame interrupt
+PC_INTRI        equ     2               ; IPC interrupt
+SV_PCINT_A      equ     $28035          ; QDOS's copy of the PC_INTR mask bits
+RTC_SECS        equ     $18000          ; real-time clock, seconds (long)
+
+POLL    macro
+        ifd POLLED
+        btst    #3,PC_INTR
+        beq.s   .np\@
+        bsr     poll_tick
+.np\@:
+        endif
+        endm
+
+; TO_QDOS / FROM_QDOS - bracket QDOS calls that need user mode + interrupts
+; (file I/O).  Leaving: the SSP register keeps our stack pointer; trap #0
+; returns to supervisor on exactly that stack.  Between them sp = the user
+; stack: push nothing there that must survive FROM_QDOS.
+TO_QDOS macro
+        ifd POLLED
+        andi.w  #$D8FF,sr
+        endif
+        endm
+FROM_QDOS macro
+        ifd POLLED
+        trap    #0
+        ori.w   #$0700,sr
+        move.b  pc_clear_f+1(pc),PC_INTR
+        endif
+        endm
+
 start:
-        ; No register save needed - job terminates with MT.FRJOB
+        ; CALLed from SuperBASIC: keep its registers, return with RTS
+        movem.l d1-d7/a0-a6,-(sp)
+        lea     entry_sp(pc),a0
+        move.l  sp,(a0)
         bsr     open_console
         tst.l   d0
         bmi     exit_fail
@@ -238,8 +287,14 @@ start:
         bsr     clear_screen
         bsr     draw_side_images
 
-        ; Set up SFX function pointers, init QSound, init diag buffer
+        ; Set up SFX/music function pointers (sfx_update, music_start, otz_decode, audio_tick...) and init QSound
         bsr     sfx_setup_ptrs
+        ifd POLLED
+        bsr     enter_polled_mode       ; supervisor, interrupts off, own stack
+        endif
+        ifd PROFILE
+        bsr     prof_init
+        endif
 
         ; Show title screen first
         bsr     init_title_screen
@@ -254,7 +309,7 @@ start_game:
         adda.l  #current_level,a0
         move.w  #1,(a0)
 
-        ; Start level 1 music (absolute addressing for far variable)
+        ; (level music is started inside load_current_level)
         ; Load first level
         bsr     load_current_level
         bsr     cache_coin_positions        ; Cache coin positions for fast animation
@@ -309,7 +364,6 @@ start_game:
         bsr     copy_window_to_screen       ; Copy visible portion to screen
         bsr     draw_scrolling_columns      ; Draw side columns
         bsr     draw_hero_force
-        ; Removed draw_level_num (level indicator removed)
         ; Force lives redraw (title screen set prev_lives, clear_screen wiped hearts)
         ; absolute addressing for far variable
         lea     start(pc),a0
@@ -331,12 +385,16 @@ main_loop:
         lea     hero_bounce_dir(pc),a0
         clr.w   (a0)
         bsr     wait_vsync
+        ifd PROFILE
+        bsr     prof_gameplay
+        endif
         movea.l sfx_update_ptr(pc),a6  ; update sound
         jsr     (a6)
         bsr     update_animation
         bsr     update_coin_animation       ; Animate large coins in buffer
         bsr     update_exit_animation       ; Animate exits when active
         ; update_hero_exit_anim merged into composite_hero_to_buffer
+        POLL
         bsr     read_keyboard
         ; Check for level reset request
         move.w  reset_level_flag(pc),d0
@@ -350,9 +408,11 @@ main_loop:
         move.w  level_complete_flag(pc),d0
         bne     handle_level_complete       ; Reached exit on first step
         ; Second movement step REMOVED (1 tile per tick)
+        POLL
         bsr     update_enemies              ; Update enemy positions/animation
         bsr     do_bullets                  ; Bullet movement (before cannon fire!)
         bsr     do_cannons                  ; Cannon timing and firing
+        POLL
         bsr     check_collision             ; Check hero/enemy collision
         tst.w   d0
         bne     handle_death                ; Collision! Handle death
@@ -361,20 +421,25 @@ main_loop:
         bne     handle_death                ; Hit by bullet!
         move.w  level_complete_flag(pc),d0  ; Check flag (set by process_tile_effects)
         bne     handle_level_complete       ; Level complete!
+        POLL
         bsr     update_camera               ; Smooth camera tracking
         ; Composite all sprites into buffer before copy (no flicker)
         bsr     composite_trails_to_buffer  ; Draw trails into buffer (behind sprites)
         bsr     composite_enemies_to_buffer ; Draw enemies into buffer
+        POLL
         bsr     composite_hero2_to_buffer   ; Draw inactive hero (behind active)
         bsr     composite_hero_to_buffer    ; Draw active hero (on top)
+        POLL
         bsr     copy_window_to_screen       ; Copy buffer+sprites to screen
         ; Bullets direct to screen (fast, no save/restore needed)
         bsr     draw_bullets_to_screen      ; Bullets drawn after copy
         ; Restore buffer (reverse order of compositing)
+        POLL
         bsr     restore_buffer_under_hero   ; Restore active hero area
         bsr     restore_buffer_under_hero2  ; Restore inactive hero area
         bsr     restore_buffer_under_enemies ; Restore enemy areas
-        bsr     restore_buffer_under_trails ; Restore trail areas in buffer
+        ; Trails stay in the buffer (no restore): see composite_trails_to_buffer
+        POLL
         bsr     draw_lives                  ; Draw lives HUD
         bsr     draw_score                  ; Draw score HUD
 
@@ -387,6 +452,9 @@ main_loop:
 ; Return to title screen (used when ESC pressed during game)
 ; ============================================================
 return_to_title:
+        ifd PROFILE
+        bsr     prof_write_log
+        endif
         bsr     init_title_screen
         bra     title_loop
 
@@ -461,8 +529,10 @@ init_title_screen:
         ; Draw the "OLD TOWER" logo
         bsr     draw_title_logo
 
-        ; Draw "v1.2" version text at bottom-left
+        ; Draw "v2.0" version text at bottom-left
         bsr     draw_version
+        lea     title_keys_text(pc),a0  ; "ENTER FOR KEYS"
+        bsr     draw_text_list
 
         ; Draw lives
         bsr     draw_lives
@@ -472,8 +542,8 @@ init_title_screen:
 
 ; ============================================================
 ; title_loop - Title screen loop, waiting for FIRE to start
-; Fixed keyboard handling using QDOS traps
-; Samples frame timing to auto-detect pacer mode
+; Keyboard: QDOS IO_FBYTE, or IPC KEYROW row 1 in the POLLED build
+; Samples frame timing to auto-detect pacer mode (QDOS-timed build only)
 ; ============================================================
 title_loop:
         bsr     wait_vsync
@@ -485,11 +555,13 @@ title_loop:
         bsr     update_exit_animation
 
         ; Composite and draw (trails into buffer for no flicker)
+        POLL
         bsr     composite_trails_to_buffer
         bsr     composite_enemies_to_buffer
         bsr     composite_hero_to_buffer
 
         ; Use title-specific copy that skips logo area (no flicker)
+        POLL
         bsr     copy_window_to_screen_title
 
         ; Columns are static - no redraw needed
@@ -500,27 +572,36 @@ title_loop:
         bsr     restore_buffer_under_trails
 
         ; Update logo colors (cycling) and redraw
+        POLL
         bsr     cycle_logo_colors
         bsr     draw_title_logo
 
         ; Draw flashing "PUSH FIRE TO START"
         bsr     draw_push_fire
 
+        POLL
         bsr     draw_lives
         bsr     draw_score
 
-        ; Check keyboard (FIRE to start, ESC to quit)
+        ; Check keyboard (FIRE to start, ENTER keys page, ESC to quit)
         bsr     check_title_key
+        cmpi.w  #2,d0
+        beq     keys_page
         tst.w   d0
-        bne.s   .title_start
+        bne.s   title_start_game
 
         ; Check if ESC was pressed
         move.w  quit_flag(pc),d0
         bne     exit_game
+        ifd AUTOPILOT
+        move.w  prof_nrec(pc),d0        ; log done: leave (tests the exit path)
+        cmpi.w  #PROF_MAXREC,d0
+        bhs     exit_game
+        endif
 
         bra     title_loop
 
-.title_start:
+title_start_game:
         ; Play swap sound on title start
         movea.l sound_to_play_ptr(pc),a0
         move.w  #SFX_SWAP,(a0)
@@ -529,6 +610,37 @@ title_loop:
 
         ; Start the actual game
         bra     start_game
+
+; ============================================================
+; keys_page - controls page (ENTER on the title).  Middle window only:
+; the side images cannot be redrawn (their data is reclaimed after init).
+; FIRE starts the game, ENTER or ESC go back to the title.
+; ============================================================
+keys_page:
+        bsr     clear_screen_preserve_sides
+        bsr     draw_version
+        lea     keys_text(pc),a0
+        bsr     draw_text_list
+        bsr     flush_keyboard
+        lea     title_flash_ctr(pc),a0
+        move.w  #TITLE_FLASH_RATE,(a0)
+.loop:  bsr     wait_vsync
+        movea.l sfx_update_ptr(pc),a6   ; music + sound
+        jsr     (a6)
+        bsr     draw_push_fire
+        POLL
+        bsr     draw_lives
+        bsr     draw_score
+        bsr     check_title_key
+        move.w  quit_flag(pc),d1
+        bne.s   .back                   ; ESC: back, not quit
+        cmpi.w  #2,d0
+        beq.s   .back                   ; ENTER
+        tst.w   d0
+        bne     title_start_game
+        bra.s   .loop
+.back:  bsr     init_title_screen       ; (clears quit_flag)
+        bra     title_loop
 
 ; Outro routines moved near buffer code (see after copy_window_to_screen_title)
 
@@ -547,6 +659,12 @@ title_pacer_overrun: dc.w 0             ; 1 if any overrun detected
 ; After sampling completes, becomes a no-op.
 ; ============================================================
 title_pacer_sample:
+        ifd POLLED
+        rts                             ; the polled clock needs no pacer choice
+        endif
+        ifd PROFILE
+        rts                             ; profile builds stay adaptive
+        endif
         move.w  title_pacer_count(pc),d0
         cmpi.w  #PACER_SKIP+PACER_SAMPLES,d0
         bge.s   .tps_done               ; Sampling complete — no-op
@@ -637,6 +755,7 @@ draw_title_logo:
         moveq   #31,d5                  ; 32 rows
 
 .row_loop:
+        POLL
         ; Get color for this row (2 rows per color entry)
         move.w  d5,d4
         lsr.w   #1,d4                   ; Divide by 2
@@ -816,11 +935,14 @@ clear_title_message_area:
 
 ; ============================================================
 ; check_title_key - Check keyboard on title screen
-; Returns: d0 = 1 if FIRE pressed, 0 otherwise
+; Returns: d0 = 1 if FIRE pressed, 2 if ENTER (keys page), 0 otherwise
 ; Sets quit_flag if ESC pressed
-; Uses QDOS TRAP #3 like other keyboard routines
+; QDOS build: IO_FBYTE (TRAP #3); POLLED build: check_title_key_polled (KEYROW)
 ; ============================================================
 check_title_key:
+        ifd POLLED
+        bra     check_title_key_polled
+        endif
         movem.l d1-d3/a0,-(sp)
 
         ; Use QDOS IO_FBYTE to read keyboard (non-blocking)
@@ -834,11 +956,13 @@ check_title_key:
         tst.l   d0
         bmi.s   .no_key                 ; No key available
 
-        ; Check if SPACE or ENTER was pressed (FIRE)
+        ; SPACE = FIRE (start), ENTER = keys page
         cmpi.b  #' ',d1
         beq.s   .fire_pressed
-        cmpi.b  #13,d1                  ; ENTER
-        beq.s   .fire_pressed
+        cmpi.b  #10,d1                  ; ENTER (QL code 10)
+        beq.s   .enter_pressed
+        cmpi.b  #13,d1
+        beq.s   .enter_pressed
 
         ; Check for ESC (quit)
         cmpi.b  #27,d1
@@ -848,9 +972,16 @@ check_title_key:
         move.w  #1,(a0)
 
 .no_key:
+        ifd AUTOPILOT
+        bsr     prof_auto_firekey
+        else
         moveq   #0,d0                   ; Return 0 (no fire)
+        endif
         bra.s   .check_done
 
+.enter_pressed:
+        moveq   #2,d0                   ; Return 2 (keys page)
+        bra.s   .check_done
 .fire_pressed:
         moveq   #1,d0                   ; Return 1 (fire pressed)
 
@@ -862,6 +993,9 @@ check_title_key:
 ; flush_keyboard - Clear any pending keys from buffer
 ; ============================================================
 flush_keyboard:
+        ifd POLLED
+        bra     kb_sync
+        endif
         movem.l d0-d3/a0,-(sp)
         move.l  con_id(pc),a0
         move.l  a0,d0
@@ -906,6 +1040,7 @@ win_loop:
         bsr     update_exit_animation   ; Keep exit animation going
 
         ; Composite graphics to buffer (trails + sprites, no flicker)
+        POLL
         bsr     composite_trails_to_buffer
         bsr     composite_enemies_to_buffer
 
@@ -931,6 +1066,7 @@ win_loop:
 .win_no_hero2:
 
         ; Copy buffer to screen
+        POLL
         bsr     copy_window_to_screen
         ; Columns are static - no redraw needed
         bsr     draw_lives
@@ -946,7 +1082,8 @@ win_loop:
         bsr     restore_buffer_under_enemies
         bsr     restore_buffer_under_trails
 
-        ; Draw flashing "PRESS SPACE" message
+        ; Draw flashing "PRESS FIRE" message
+        POLL
         bsr     draw_press_space
 
         ; Check for SPACE key press
@@ -970,12 +1107,12 @@ win_loop:
         lea     game_state(pc),a0
         move.w  #GS_GAMEPLAY,(a0)
 
-        ; Clear the "PRESS SPACE" message area
+        ; Clear the "PRESS FIRE" message area
         bsr     clear_message_area
 
-        ; Black flash on playfield+columns for 0.5s
+        ; Black flash on playfield+columns for ~0.6s
         bsr     black_playfield
-        moveq   #15-1,d7                ; 15 frames = 0.3s at 50fps
+        moveq   #15-1,d7                ; 15 frames = 0.6s at 25fps
 .black_wait:
         bsr     wait_vsync
         move.l  d7,-(sp)                ; save counter
@@ -990,10 +1127,13 @@ win_loop:
 
 ; ============================================================
 ; check_space_key - Check if SPACE is pressed (non-blocking)
-; Uses QDOS IO_FBYTE via console channel
+; QDOS build: IO_FBYTE via console channel; POLLED build: check_space_key_polled (KEYROW)
 ; Returns: d0 = 1 if pressed, 0 if not
 ; ============================================================
 check_space_key:
+        ifd POLLED
+        bra     check_space_key_polled
+        endif
         movem.l d1-d3/a0,-(sp)
 
         ; Use QDOS IO_FBYTE to read keyboard (non-blocking)
@@ -1025,14 +1165,18 @@ check_space_key:
         bra.s   .check_done
 
 .no_key:
+        ifd AUTOPILOT
+        bsr     prof_auto_firekey
+        else
         moveq   #0,d0
+        endif
 
 .check_done:
         movem.l (sp)+,d1-d3/a0
         rts
 
 ; ============================================================
-; draw_press_fire - Draw flashing "PRESS FIRE" at screen bottom
+; draw_press_space - Draw flashing "PRESS FIRE" at screen bottom
 ; Uses proper 8x8 character font rendering
 ; MODE 8: 4 bits/pixel, 1 byte = 2 pixels, 4 bytes = 8 pixels = 1 char
 ; ============================================================
@@ -1151,6 +1295,8 @@ draw_char_with_stride:
         beq.s   .dcw_n0
         ori.w   #$0203,d2
 .dcw_n0:
+        and.w   char_colour(pc),d1      ; colour (white = $AAFF)
+        and.w   char_colour(pc),d2
         move.w  d1,(a1)                 ; Write pixels 0-3
         move.w  d2,2(a1)                ; Write pixels 4-7
 
@@ -1258,6 +1404,91 @@ msg_font:
         dc.b    $00,$18,$18,$18,$00,$18,$00,$00
         ; : (index 28) - from Spectrum font ASCII 58
         dc.b    $00,$00,$10,$00,$10,$00,$00,$00
+        ; B (index 29) - from Spectrum font ASCII 66 (keys page)
+        dc.b    $00,$7C,$66,$7C,$66,$7C,$00,$00
+        ; / (index 30) - ASCII 47
+        dc.b    $00,$00,$00,$04,$08,$10,$00,$00
+        ; ( (index 31) - ASCII 40
+        dc.b    $00,$04,$08,$08,$08,$04,$00,$00
+        ; ) (index 32) - ASCII 41
+        dc.b    $00,$20,$10,$10,$10,$20,$00,$00
+        even
+char_colour:    dc.w    $AAFF           ; draw_char colour mask (white)
+
+; ============================================================
+; draw_text_list - draw a list of strings (see keys_text)
+; Input: a0 = list.  Restores char_colour to white.
+; ============================================================
+draw_text_list:
+        movem.l d0/a0-a2,-(sp)
+        lea     char_colour(pc),a2
+.rec:   move.w  (a0)+,d0
+        bmi.s   .end
+        lea     SCREEN_BASE,a1
+        adda.w  d0,a1
+        move.w  (a0)+,(a2)
+.ch:    moveq   #0,d0
+        move.b  (a0)+,d0
+        cmpi.b  #$FF,d0
+        beq.s   .next
+        bsr     draw_char_at
+        addq.l  #4,a1
+        bra.s   .ch
+.next:  move.l  a0,d0
+        addq.l  #1,d0
+        andi.b  #$FE,d0                 ; records are word aligned
+        movea.l d0,a0
+        bra.s   .rec
+.end:   move.w  #$AAFF,(a2)
+        movem.l (sp)+,d0/a0-a2
+        rts
+
+; Keys page text: per record dc.w screen offset, colour mask;
+; dc.b font indices, $FF; even.  List ends with dc.w -1.
+keys_text:
+        dc.w    7214,$AAAA
+        dc.b    5,13,17,12,1,13,14,3,$FF   ; "CONTROLS"
+        even
+        dc.w    9250,$AAFF
+        dc.b    4,1,1,13,16,3,30,26,13,19,3,12,8,5,18,$FF   ; "ARROWS/JOYSTICK"
+        even
+        dc.w    10282,$AA55
+        dc.b    21,13,24,2,$FF   ; "MOVE"
+        even
+        dc.w    12322,$AAFF
+        dc.b    3,0,4,5,2,30,7,8,1,2,$FF   ; "SPACE/FIRE"
+        even
+        dc.w    13354,$AA55
+        dc.b    3,16,4,0,6,11,2,1,13,$FF   ; "SWAP HERO"
+        even
+        dc.w    15394,$AAFF
+        dc.b    2,17,12,2,1,$FF   ; "ENTER"
+        even
+        dc.w    16426,$AA55
+        dc.b    1,2,3,12,4,1,12,6,14,2,24,2,14,$FF   ; "RESTART LEVEL"
+        even
+        dc.w    17450,$AA55
+        dc.b    31,5,13,3,12,3,6,4,6,14,8,7,2,32,$FF   ; "(COSTS A LIFE)"
+        even
+        dc.w    19490,$AAFF
+        dc.b    2,3,5,$FF   ; "ESC"
+        even
+        dc.w    20522,$AA55
+        dc.b    29,4,5,18,6,12,13,6,12,8,12,14,2,$FF   ; "BACK TO TITLE"
+        even
+        dc.w    22562,$AAFF
+        dc.b    2,3,5,6,13,17,6,12,8,12,14,2,$FF   ; "ESC ON TITLE"
+        even
+        dc.w    23594,$AA55
+        dc.b    25,10,8,12,$FF   ; "QUIT"
+        even
+        dc.w    -1
+; Title: "ENTER FOR KEYS" just above PUSH FIRE TO START
+title_keys_text:
+        dc.w    29220,$AA55
+        dc.b    2,17,12,2,1,6,7,13,1,6,18,2,19,3,$FF   ; "ENTER FOR KEYS"
+        even
+        dc.w    -1
         even
 
 ; String data: "PRESS FIRE" as character indices
@@ -1328,6 +1559,7 @@ handle_death:
         ; Draw background first
         bsr     copy_window_to_screen
         ; Columns are static - no redraw needed
+        POLL
         bsr     draw_lives                  ; Keep lives HUD visible
         bsr     draw_score                  ; Keep score visible
 
@@ -1370,6 +1602,9 @@ handle_death:
         lea     lives(pc),a0
         move.w  (a0),d0
         subq.w  #1,d0
+        ifd AUTOPILOT
+        moveq   #MAX_LIVES,d0
+        endif
         move.w  d0,(a0)
         beq     game_over               ; No lives left, game over
 
@@ -1379,7 +1614,7 @@ handle_death:
         bra     main_loop
 
 ; ============================================================
-; handle_reset_level - Player pressed R to reset level
+; handle_reset_level - Player pressed ENTER (or R in the QDOS build) to reset level
 ; Fully reloads level (coins, hidden tiles, enemies restored)
 ; Costs 1 life. If no lives left, game over.
 ; ============================================================
@@ -1434,7 +1669,6 @@ full_restart_level:
         bsr     copy_window_to_screen
         bsr     draw_scrolling_columns
         bsr     draw_hero_force
-        ; Removed draw_level_num
         bsr     draw_lives
         rts
 
@@ -1553,6 +1787,9 @@ draw_lives:
         rts
 
 exit_game:
+        ifd POLLED
+        bsr     leave_polled_mode       ; user mode, interrupts on
+        endif
         movea.l ay_silence_ptr(pc),a6   ; Silence QSound before exit
         jsr     (a6)
         bsr     close_console
@@ -1561,18 +1798,18 @@ exit_game:
         moveq   #4,d1           ; MODE 4
         moveq   #0,d2           ; Don't clear screen
         trap    #1
-        ; Terminate as QDOS job (don't RTS)
-        moveq   #MT_FRJOB,d0    ; Force remove job
-        moveq   #-1,d1          ; This job
-        moveq   #0,d3           ; No error
-        trap    #1              ; Never returns
+        moveq   #0,d0           ; no error
+        ; Back to SuperBASIC: its stack and registers as at CALL
+exit_to_basic:
+        movea.l entry_sp(pc),sp
+        movem.l (sp)+,d1-d7/a0-a6
+        rts
 
 exit_fail:
-        ; Terminate with error
-        moveq   #MT_FRJOB,d0    ; Force remove job
-        moveq   #-1,d1          ; This job
-        moveq   #-1,d3          ; Error code
-        trap    #1              ; Never returns
+        ; open_console failed: d0 = its QDOS error code
+        bra.s   exit_to_basic
+
+entry_sp:       dc.l    0               ; sp after the entry movem (CALL)
 
 ; ============================================================
 ; sfx_setup_ptrs - Compute absolute addresses of SFX routines
@@ -1602,6 +1839,16 @@ sfx_setup_ptrs:
         lea     sound_to_play_ptr(pc),a1
         move.l  a0,(a1)
         addi.l  #sound_to_play,(a1)
+
+        lea     music_start_ptr(pc),a1
+        move.l  a0,(a1)
+        addi.l  #music_start,(a1)
+        lea     otz_decode_ptr(pc),a1
+        move.l  a0,(a1)
+        addi.l  #otz_decode,(a1)
+        lea     audio_tick_ptr(pc),a1
+        move.l  a0,(a1)
+        addi.l  #audio_tick,(a1)
 
         ; Call qsound_init (too far for bsr from main init)
         lea     qsound_init_ptr(pc),a1
@@ -1641,13 +1888,28 @@ level_remap:
         dc.w    18              ; Index 20 (L25): load from L23
 
 ; ============================================================
-; load_current_level - Decompress level from RLE compressed data
+; load_current_level - Decompress level from OTZ-packed data (otz_decode)
 ; ============================================================
-; Uses RLE compressed level data for ~9KB savings.
+; Levels are OTZ-packed (bit-level LZ, tools/otzpack.py).
 ; Uses level_remap table for difficulty progression.
 ; ============================================================
 load_current_level:
         movem.l d0-d2/a0-a2,-(sp)
+
+        ; Music for this level (music_start: same track keeps playing)
+        move.w  current_level(pc),d1
+        moveq   #MUSIC_MENU,d0
+        tst.w   d1
+        beq.s   .mus
+        moveq   #MUSIC_LEVEL1,d0
+        cmpi.w  #11,d1
+        blt.s   .mus
+        moveq   #MUSIC_LEVEL2,d0
+        cmpi.w  #16,d1
+        blt.s   .mus
+        moveq   #MUSIC_LEVEL3,d0
+.mus:   movea.l music_start_ptr(pc),a0
+        jsr     (a0)
 
         ; Remap current_level through lookup table
         move.w  current_level(pc),d0
@@ -1659,8 +1921,8 @@ load_current_level:
         add.w   d0,d0                   ; word index for offsets
         lea     level_offsets(pc),a0
         move.w  (a0,d0.w),d0            ; d0 = offset into compressed data
-        lea     levels_compressed(pc),a0
-        adda.w  d0,a0                   ; a0 = compressed source
+        lea     levels_otz(pc),a0
+        adda.w  d0,a0                   ; a0 = packed source
 
         ; Get destination (two-step lea for level_working)
         lea     .lw_ref(pc),a1
@@ -1670,7 +1932,7 @@ load_current_level:
         ; a1 = destination (level_working)
         ; d2 = output size
         move.w  #LEVEL_SIZE,d2
-        bsr     rle_decompress
+        bsr     otz_decode
 
         ; Store working buffer pointer for renderer
         ; a1 is preserved by decompressor, still points to level_working
@@ -1679,48 +1941,66 @@ load_current_level:
 
         ; Set world-specific block tiles based on level number
         bsr     set_world_tiles
+        ifd PROFILE
+        bsr     prof_marker
+        endif
 
         movem.l (sp)+,d0-d2/a0-a2
         rts
 
 ; ============================================================
-; rle_decompress - RLE decompressor
+; otz_decode - OTZ (bit-level LZ) decoder; format and packer: tools/otzpack.py
+; Input:  a0 = packed data, a1 = destination, d2.w = output size (bytes)
+; Output: a1 preserved (destination start).  All registers preserved.
+;   flag 0: literal byte; flag 1: match, offset = (gamma-1)*256 + byte + 1,
+;   length = gamma + 1.  gamma = interlaced Elias gamma.  d7.b = bit buffer
+;   with a marker bit: when it shifts out empty, refill from the stream.
 ; ============================================================
-; Input:  a0 = source (compressed data)
-;         a1 = destination buffer
-;         d2.w = output size (bytes to decompress)
-; Output: a1 preserved (still points to destination start)
-; Encoding:
-;   Byte < $80: literal byte
-;   Byte >= $80: (count | $80), value - repeat 'value' 'count' times
-; ============================================================
-rle_decompress:
-        movem.l d0-d3/a0-a1,-(sp)
-        moveq   #0,d0
-        moveq   #0,d1
-.rd_loop:
-        tst.w   d2
-        beq.s   .rd_done                ; d2 = 0, finished
-        move.b  (a0)+,d0                ; Read control byte
-        tst.b   d0
-        bpl.s   .rd_literal             ; Bit 7 clear = literal (0-127)
-        ; It's a run: extract count, get value
-        andi.w  #$007F,d0               ; d0.w = count (1-127)
-        move.b  (a0)+,d1                ; d1.b = value to repeat
-        sub.w   d0,d2                   ; Subtract full count from output remaining
-        move.w  d0,d3                   ; d3 = count for loop
-.rd_run:
-        move.b  d1,(a1)+                ; Write value
-        subq.w  #1,d3                   ; Decrement run counter
-        bne.s   .rd_run                 ; More to write?
-        bra.s   .rd_loop
-.rd_literal:
-        move.b  d0,(a1)+                ; Write literal byte
-        subq.w  #1,d2                   ; Decrement output counter
-        bra.s   .rd_loop
-.rd_done:
-        movem.l (sp)+,d0-d3/a0-a1
+GETBIT  macro
+        add.b   d7,d7
+        bne.s   .gb\@
+        move.b  (a0)+,d7
+        addx.b  d7,d7
+.gb\@:
+        endm
+
+otz_decode:
+        movem.l d1-d2/d7/a0-a3,-(sp)
+        movea.l a1,a2
+        adda.w  d2,a2                   ; a2 = end of output
+        moveq   #-128,d7                ; empty bit buffer (marker only)
+.next:
+        POLL
+        cmpa.l  a2,a1
+        bhs.s   .done
+        GETBIT
+        bcs.s   .match
+        move.b  (a0)+,(a1)+             ; literal
+        bra.s   .next
+.match:
+        bsr.s   .gamma
+        subq.w  #1,d1
+        lsl.w   #8,d1
+        move.b  (a0)+,d1                ; d1 = offset - 1
+        movea.l a1,a3
+        suba.w  d1,a3
+        subq.l  #1,a3                   ; a3 = source of the copy
+        bsr.s   .gamma                  ; d1 = length - 1
+.copy:  move.b  (a3)+,(a1)+
+        dbra    d1,.copy
+        bra.s   .next
+.done:
+        movem.l (sp)+,d1-d2/d7/a0-a3
         rts
+; .gamma - d1.w = interlaced Elias gamma value
+.gamma:
+        moveq   #1,d1
+.gloop: GETBIT
+        bcs.s   .gend
+        GETBIT
+        addx.w  d1,d1
+        bra.s   .gloop
+.gend:  rts
 
 ; ============================================================
 ; set_world_tiles - Copy appropriate block tiles for current world
@@ -1813,6 +2093,7 @@ cache_coin_positions:
         move.w  #LEVEL_SIZE-1,d3        ; d3 = loop counter
 
 .scan:
+        POLL
         move.b  (a0)+,d0                ; Read tile type, advance pointer
 
         ; Check for any coin type (6 or 7)
@@ -1900,6 +2181,7 @@ cache_exit_positions:
         move.w  #LEVEL_SIZE-1,d3        ; d3 = loop counter
 
 .exit_scan:
+        POLL
         move.b  (a0)+,d0                ; Read tile type
         cmpi.b  #TILE_EXIT,d0
         bne.s   .exit_next
@@ -1957,7 +2239,7 @@ next_level:
         bsr     clear_trails
         bsr     render_playfield_to_buffer  ; Render new level to buffer
         bsr     copy_window_to_screen       ; Copy visible portion to screen
-        bsr     draw_scrolling_columns      ; Draw animated side columns
+        bsr     draw_scrolling_columns      ; Draw side columns (static)
 
         ; Reset hero state (optimized - only essential resets)
         lea     hero_dir(pc),a0
@@ -1974,154 +2256,11 @@ next_level:
         clr.w   (a0)
 
         bsr     draw_hero_force
-        ; Removed draw_level_num
         bsr     draw_lives                  ; Draw lives HUD
         bsr     draw_score                  ; Draw score on new level
 
         movem.l (sp)+,d0/a0
         rts
-
-; ============================================================
-; draw_level_num - Draw current level number in top-left
-; No longer called, but keeping routine for reference
-; ============================================================
-; Uses lookup table to avoid DIVU issues
-; Level indices 1-15 display as "01"-"15"
-; Level indices 16-20 display as "21"-"25"
-; ============================================================
-draw_level_num:
-        movem.l d0-d2/a0-a2,-(sp)
-
-        ; Draw at top-left of screen (above playfield)
-        lea     SCREEN_BASE+SCREEN_STRIDE*2+4,a0
-
-        ; Draw "L" prefix using white without flash
-        move.l  #$80800000,(a0)
-        move.l  #$80800000,SCREEN_STRIDE(a0)
-        move.l  #$80800000,SCREEN_STRIDE*2(a0)
-        move.l  #$80800000,SCREEN_STRIDE*3(a0)
-        move.l  #$80800000,SCREEN_STRIDE*4(a0)
-        move.l  #$80800000,SCREEN_STRIDE*5(a0)
-        move.l  #$A8A80000,SCREEN_STRIDE*6(a0)
-        move.l  #$A8A80000,SCREEN_STRIDE*7(a0)
-
-        ; Get level index and look up display digits
-        move.w  current_level(pc),d0
-        andi.w  #$1F,d0                 ; Safety clamp to 0-31
-        add.w   d0,d0                   ; d0 = index * 2 (word offset)
-        lea     level_display_table(pc),a2
-        move.w  (a2,d0.w),d2            ; d2 = packed digits (tens:units)
-
-        ; Draw tens digit at offset 4
-        lea     4(a0),a1
-        move.w  d2,d1
-        lsr.w   #8,d1                   ; d1 = tens digit
-        bsr.s   draw_digit
-
-        ; Draw units digit at offset 8
-        lea     8(a0),a1
-        move.w  d2,d1
-        andi.w  #$FF,d1                 ; d1 = units digit
-        bsr.s   draw_digit
-
-        movem.l (sp)+,d0-d2/a0-a2
-        rts
-
-; Level display lookup table: packed tens:units for each level index
-; Index 0-15 -> display 00-15, Index 16-20 -> display 21-25
-level_display_table:
-        dc.w    $0000           ; Index 0: "00" (unused)
-        dc.w    $0001           ; Index 1: "01"
-        dc.w    $0002           ; Index 2: "02"
-        dc.w    $0003           ; Index 3: "03"
-        dc.w    $0004           ; Index 4: "04"
-        dc.w    $0005           ; Index 5: "05"
-        dc.w    $0006           ; Index 6: "06"
-        dc.w    $0007           ; Index 7: "07"
-        dc.w    $0008           ; Index 8: "08"
-        dc.w    $0009           ; Index 9: "09"
-        dc.w    $0100           ; Index 10: "10"
-        dc.w    $0101           ; Index 11: "11"
-        dc.w    $0102           ; Index 12: "12"
-        dc.w    $0103           ; Index 13: "13"
-        dc.w    $0104           ; Index 14: "14"
-        dc.w    $0105           ; Index 15: "15"
-        dc.w    $0201           ; Index 16: "21"
-        dc.w    $0202           ; Index 17: "22"
-        dc.w    $0203           ; Index 18: "23"
-        dc.w    $0204           ; Index 19: "24"
-        dc.w    $0205           ; Index 20: "25"
-
-; ============================================================
-; draw_digit - Draw a single digit (0-9) at a1
-; Input: d1 = digit (0-9), a1 = screen address
-; ============================================================
-; MODE 8 white pixel patterns (no flash):
-; Pixel 0: $8080, Pixel 1: $2020, Pixel 2: $0808, Pixel 3: $0202
-; ============================================================
-draw_digit:
-        movem.l d0-d2/a0-a2,-(sp)
-
-        lea     digit_patterns(pc),a0
-        move.w  d1,d0
-        lsl.w   #3,d0           ; d0 = digit * 8
-        adda.w  d0,a0           ; a0 = pattern for this digit
-
-        moveq   #7,d2
-.row:
-        move.b  (a0)+,d0
-        ; Expand 1bpp to MODE 8 white (no flash)
-        ; Each bit maps to white pixel pattern
-        moveq   #0,d1
-        btst    #7,d0
-        beq.s   .b7
-        ori.w   #$8080,d1       ; Pixel 0 white
-.b7:    btst    #6,d0
-        beq.s   .b6
-        ori.w   #$2020,d1       ; Pixel 1 white
-.b6:    btst    #5,d0
-        beq.s   .b5
-        ori.w   #$0808,d1       ; Pixel 2 white
-.b5:    btst    #4,d0
-        beq.s   .b4
-        ori.w   #$0202,d1       ; Pixel 3 white
-.b4:
-        move.w  d1,(a1)
-        ; Second half (pixels 4-7)
-        moveq   #0,d1
-        btst    #3,d0
-        beq.s   .b3
-        ori.w   #$8080,d1       ; Pixel 4 white
-.b3:    btst    #2,d0
-        beq.s   .b2
-        ori.w   #$2020,d1       ; Pixel 5 white
-.b2:    btst    #1,d0
-        beq.s   .b1
-        ori.w   #$0808,d1       ; Pixel 6 white
-.b1:    btst    #0,d0
-        beq.s   .b0
-        ori.w   #$0202,d1       ; Pixel 7 white
-.b0:
-        move.w  d1,2(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        dbra    d2,.row
-
-        movem.l (sp)+,d0-d2/a0-a2
-        rts
-
-; Simple 8x8 digit patterns (1bpp)
-digit_patterns:
-        dc.b    $3C,$66,$6E,$76,$66,$66,$3C,$00  ; 0
-        dc.b    $18,$38,$18,$18,$18,$18,$7E,$00  ; 1
-        dc.b    $3C,$66,$06,$1C,$30,$60,$7E,$00  ; 2
-        dc.b    $3C,$66,$06,$1C,$06,$66,$3C,$00  ; 3
-        dc.b    $0C,$1C,$3C,$6C,$7E,$0C,$0C,$00  ; 4
-        dc.b    $7E,$60,$7C,$06,$06,$66,$3C,$00  ; 5
-        dc.b    $1C,$30,$60,$7C,$66,$66,$3C,$00  ; 6
-        dc.b    $7E,$06,$0C,$18,$30,$30,$30,$00  ; 7
-        dc.b    $3C,$66,$66,$3C,$66,$66,$3C,$00  ; 8
-        dc.b    $3C,$66,$66,$3E,$06,$0C,$38,$00  ; 9
-        even
 
 ; ============================================================
 ; Score variables (placed near draw_score for PC-relative range)
@@ -2148,6 +2287,24 @@ score_font_5row:
         dc.b    $3c,$66,$3e,$06,$3c         ; 9
         even
 
+; Pre-expanded score font: 10 digits x 5 rows, one MODE 8 long per row
+; (generated from score_font_5row by tools/patch_score.py)
+score_font_exp:
+        dc.l    $0A0AA0A0,$28282828,$2828A8A8,$2A2A2828,$0A0AA0A0  ; 0
+        dc.l    $0A0A8080,$02028080,$02028080,$02028080,$0A0AA0A0  ; 1
+        dc.l    $0A0AA0A0,$20202828,$0202A0A0,$28280000,$2A2AA8A8  ; 2
+        dc.l    $0A0AA0A0,$20202828,$0000A0A0,$20202828,$0A0AA0A0  ; 3
+        dc.l    $0000A0A0,$0202A0A0,$0808A0A0,$2A2AA0A0,$0000A0A0  ; 4
+        dc.l    $2A2AA8A8,$28280000,$2A2AA0A0,$00002828,$2A2AA0A0  ; 5
+        dc.l    $0A0AA0A0,$28280000,$2A2AA0A0,$28282828,$0A0AA0A0  ; 6
+        dc.l    $2A2AA8A8,$00002828,$00002828,$0000A0A0,$02028080  ; 7
+        dc.l    $0A0AA0A0,$28282828,$0A0AA0A0,$28282828,$0A0AA0A0  ; 8
+        dc.l    $0A0AA0A0,$28282828,$0A0AA8A8,$00002828,$0A0AA0A0  ; 9
+
+; Digits currently on screen ($FF = unknown -> redraw)
+score_digits:    dc.b    $FF,$FF,$FF,$FF,$FF,$FF
+        even
+
 ; Division table for score-to-decimal conversion
 score_divisors:
         dc.l    100000,10000,1000,100,10,1
@@ -2166,16 +2323,17 @@ draw_score:
         lea     prev_score(pc),a0
         move.l  d0,(a0)
 
-        movem.l d0-d7/a0-a4,-(sp)
+        movem.l d0-d4/a0-a4,-(sp)
 
-        ; Convert score (d0.l) to 6 decimal digits
-        ; Use repeated subtraction with divisor table
+        ; Convert score (d0.l) to 6 decimal digits by repeated subtraction;
+        ; draw only the digits that differ from what is on screen.
         lea     score_divisors(pc),a2
-        ; Score position indented to match lives (2 bytes from edge)
-        ; 6 digits × 4 bytes = 24; screen width = 128 bytes; 128-24-2 = 102
+        lea     score_digits(pc),a0
+        lea     score_font_exp(pc),a1
+        ; 6 digits x 4 bytes = 24; 128-24-2 = 102 (indented to match lives)
         lea     SCREEN_BASE+SCREEN_STRIDE*5+102,a3
 
-        moveq   #5,d7                       ; 6 digits (0-5)
+        moveq   #5,d4                       ; 6 digits (0-5)
 .next_digit:
         move.l  (a2)+,d1                    ; d1 = divisor
         moveq   #0,d2                       ; d2 = digit value
@@ -2183,67 +2341,46 @@ draw_score:
         cmp.l   d1,d0
         blt.s   .sub_done
         sub.l   d1,d0
-        addq.l  #1,d2
+        addq.w  #1,d2
         bra.s   .sub_loop
 .sub_done:
-        ; d2 = digit (0-9), draw it at a3
-        ; Look up font pattern: digit * 5 bytes
-        move.l  a3,a4                       ; a4 = screen pos for this digit
-        lea     score_font_5row(pc),a1
+        cmp.b   (a0),d2
+        beq.s   .same                       ; already on screen
+        move.b  d2,(a0)
+        ; font row block = digit * 20 bytes
         move.w  d2,d3
-        mulu    #5,d3                       ; d3 = offset into font
-        adda.w  d3,a1                       ; a1 = font data for this digit
+        lsl.w   #2,d3                       ; *4
+        add.w   d3,d2                       ; *5
+        add.w   d2,d2
+        add.w   d2,d2                       ; *20
+        lea     0(a1,d2.w),a4
+        move.l  (a4)+,(a3)
+        move.l  (a4)+,SCREEN_STRIDE(a3)
+        move.l  (a4)+,SCREEN_STRIDE*2(a3)
+        move.l  (a4)+,SCREEN_STRIDE*3(a3)
+        move.l  (a4)+,SCREEN_STRIDE*4(a3)
+.same:
+        addq.l  #1,a0
+        addq.l  #4,a3                       ; next digit (8 pixels)
+        dbra    d4,.next_digit
 
-        ; Draw 5 rows, expand 1bpp → MODE 8 white
-        moveq   #4,d4                       ; 5 rows (0-4)
-.score_row:
-        move.b  (a1)+,d3                    ; Get font byte
-        ; Expand high nibble (pixels 0-3) → first word
-        moveq   #0,d5
-        btst    #7,d3
-        beq.s   .sr7
-        ori.w   #$8080,d5
-.sr7:   btst    #6,d3
-        beq.s   .sr6
-        ori.w   #$2020,d5
-.sr6:   btst    #5,d3
-        beq.s   .sr5
-        ori.w   #$0808,d5
-.sr5:   btst    #4,d3
-        beq.s   .sr4
-        ori.w   #$0202,d5
-.sr4:
-        move.w  d5,(a4)
-        ; Expand low nibble (pixels 4-7) → second word
-        moveq   #0,d5
-        btst    #3,d3
-        beq.s   .sr3
-        ori.w   #$8080,d5
-.sr3:   btst    #2,d3
-        beq.s   .sr2
-        ori.w   #$2020,d5
-.sr2:   btst    #1,d3
-        beq.s   .sr1
-        ori.w   #$0808,d5
-.sr1:   btst    #0,d3
-        beq.s   .sr0
-        ori.w   #$0202,d5
-.sr0:
-        move.w  d5,2(a4)
-        adda.w  #SCREEN_STRIDE,a4           ; Next row
-        dbra    d4,.score_row
-
-        addq.l  #4,a3                       ; Advance to next digit position (4 bytes = 8 pixels)
-        dbra    d7,.next_digit
-
-        movem.l (sp)+,d0-d7/a0-a4
+        movem.l (sp)+,d0-d4/a0-a4
 .score_done:
         rts
 
+; score_digits_invalidate - the HUD was wiped: next change redraws all six
+score_digits_invalidate:
+        move.l  a0,-(sp)
+        lea     score_digits(pc),a0
+        move.l  #$FFFFFFFF,(a0)+
+        move.w  #$FFFF,(a0)
+        move.l  (sp)+,a0
+        rts
+
 ; ============================================================
-; draw_version - Blit "v1.2" bitmap at bottom-left of intro screen
-; 15px wide (4 words) x 4 rows, pre-rendered Mode 8 white pixels.
-; Called once from init_title_screen.
+; draw_version - Blit "v2.0" bitmap at bottom-left of intro screen
+; 16px wide (4 words) x 4 rows, pre-rendered Mode 8 white pixels.
+; Called from init_title_screen and keys_page.
 ; ============================================================
 draw_version:
         movem.l d0/a0-a1,-(sp)
@@ -2259,16 +2396,16 @@ draw_version:
         movem.l (sp)+,d0/a0-a1
         rts
 
-; Pre-rendered Mode 8 bitmap: "v1.2" 15px x 4 rows, white on black
+; Pre-rendered Mode 8 bitmap: "v2.0" 16px x 4 rows, white on black
 ver_bitmap:
-        dc.w    $2233,$080C,$0A0F,$80C0  ; .#.#..#...###.
-        dc.w    $2233,$080C,$0000,$80C0  ; .#.#..#.......
-        dc.w    $2A3F,$080C,$0203,$0000  ; .###..#....#..
-        dc.w    $080C,$080C,$8ACF,$80C0  ; ..#...#.#.###.
+        dc.w    $2233,$2A3F,$0203,$A0F0  ; .#.#.###...###..
+        dc.w    $2233,$0203,$0203,$2030  ; .#.#...#...#.#..
+        dc.w    $2A3F,$080C,$0203,$2030  ; .###..#....#.#..
+        dc.w    $080C,$2A3F,$2233,$A0F0  ; ..#..###.#.###..
 
 ; ============================================================
-; wait_vsync with 25fps frame pacing (debug/timing code removed)
-; Two modes - adaptive (default) or forced 25fps
+; wait_vsync with 25fps frame pacing (POLLED build: jumps to wait_frame_polled)
+; QDOS-timed build only: two modes - adaptive (default) or forced 25fps
 ; Waits until 2 ticks have elapsed since previous frame end.
 ; ============================================================
 FRAME_TICKS     equ 2                   ; Target: 2 ticks = 40ms = 25fps
@@ -2278,6 +2415,9 @@ PACER_ADAPTIVE  equ 0                   ; Adaptive timing (default)
 PACER_FORCED    equ 1                   ; Forced 25fps
 
 wait_vsync:
+        ifd POLLED
+        bra     wait_frame_polled
+        endif
         ; Quick mode check - branch to forced if non-zero
         move.w  frame_pacer_mode(pc),d0
         bne.s   wait_vsync_forced
@@ -2289,22 +2429,44 @@ wait_vsync_adaptive:
         movea.l tick_counter_ptr(pc),a1
         move.w  (a1),d0
         sub.w   prev_tick(pc),d0
+        ifd PROFILE
+        bsr     prof_entry
+        endif
         cmpi.w  #FRAME_TICKS,d0
         bge.s   .a_overrun
         ; Clear overrun flag (for pacer sampling)
         lea     frame_overrun(pc),a0
         clr.w   (a0)
+        ifd PROFILE
+        move.l  d1,-(sp)
+        moveq   #0,d1
+.a_wait:
+        addq.l  #1,d1
+        move.w  (a1),d0
+        sub.w   prev_tick(pc),d0
+        cmpi.w  #FRAME_TICKS,d0
+        blt.s   .a_wait
+        bsr     prof_frame
+        move.l  (sp)+,d1
+        else
 .a_wait:
         move.w  (a1),d0
         sub.w   prev_tick(pc),d0
         cmpi.w  #FRAME_TICKS,d0
         blt.s   .a_wait
+        endif
         bra.s   .a_save
 
 .a_overrun:
         ; Set overrun flag (for pacer sampling)
         lea     frame_overrun(pc),a0
         move.w  #1,(a0)
+        ifd PROFILE
+        move.l  d1,-(sp)
+        moveq   #0,d1
+        bsr     prof_frame
+        move.l  (sp)+,d1
+        endif
 
 .a_save:
         add.w   prev_tick(pc),d0
@@ -2736,7 +2898,7 @@ is_solid_for_hero:
 ; Copies 1024 bytes (32 tiles x 32 bytes)
 ; ============================================================
 expand_tiles:
-        movem.l d0-d7/a0-a1,-(sp)
+        movem.l d0-d7/a0-a2,-(sp)
 
         lea     tiles_4bpp(pc),a0
         lea     expanded_tiles(pc),a1
@@ -2749,7 +2911,7 @@ expand_tiles:
         lea     32(a1),a1          ; Advance dest pointer
         dbra    d0,.copy_loop
 
-        movem.l (sp)+,d0-d7/a0-a1
+        movem.l (sp)+,d0-d7/a0-a2
         rts
 
 ; ============================================================
@@ -2801,80 +2963,71 @@ update_coin_animation:
 
 ; ============================================================
 ; refresh_coin_tiles - Re-render visible TILE_COIN_LG tiles to buffer
-; OPTIMIZED: No per-coin stack operations
-;   - d5 used for loop counter (not clobbered by render_tile_to_buffer)
-;   - Inlined tile copy, pre-computed tile address in a2
-;   - a1 used as buffer dest, a2 as tile source (indexed, not incremented)
+; Passes coin_cache + the current TILE_COIN_LG image (a1) to
+; refresh_tile_list (tile held in d5-d7/a2-a6, loop count in d2)
 ; ============================================================
 refresh_coin_tiles:
-        movem.l d0-d5/a0-a2,-(sp)
+        move.w  num_cached_coins(pc),d2
+        beq.s   .rc_out
+        movem.l d0-d7/a0-a6,-(sp)
+        ifd PROFILE
+        lea     prof_flags(pc),a1
+        bset    #0,(a1)
+        endif
+        lea     coin_cache(pc),a0
+        lea     expanded_tiles+TILE_COIN_LG*32(pc),a1
+        bsr.s   refresh_tile_list
+        movem.l (sp)+,d0-d7/a0-a6
+.rc_out:
+        rts
 
-        ; Calculate visible tile range based on window_y
+; ============================================================
+; refresh_tile_list - re-render every VISIBLE cached tile with one image
+; Input: a0 = (y,x) byte pairs ($FF y = collected, skipped)
+;        d2.w = count (> 0), a1 = 32-byte expanded tile
+; The tile is held in 8 registers, so each row is one register store.
+; Clobbers d0-d7/a0-a6 (callers save them).
+; ============================================================
+refresh_tile_list:
         move.w  window_y(pc),d3
         lsr.w   #3,d3                   ; d3 = first visible tile row
         move.w  d3,d4
-        addi.w  #PLAY_H,d4              ; d4 = last visible tile row (exclusive)
-
-        ; Pre-compute expanded tile address (constant for all coins)
-        lea     expanded_tiles(pc),a2
-        adda.w  #TILE_COIN_LG*32,a2     ; a2 = expanded TILE_COIN_LG source
-
-        ; Iterate through cached coin positions
-        move.w  num_cached_coins(pc),d5
-        beq.s   .done                   ; No coins cached
-        subq.w  #1,d5                   ; Adjust for dbra
-        lea     coin_cache(pc),a0
-
-.coin_loop:
-        ; Load y,x from cache (stored as y,x bytes)
-        move.b  (a0)+,d1                ; d1 = tile_y
-        move.b  (a0)+,d0                ; d0 = tile_x
-
-        ; Check if collected ($FF marker)
+        addi.w  #PLAY_H,d4              ; d4 = last visible row (exclusive)
+        movem.l (a1),d5-d7/a2-a6        ; tile rows 0-7
+        subq.w  #1,d2
+.loop:
+        POLL
+        moveq   #0,d1
+        move.b  (a0)+,d1                ; y
+        moveq   #0,d0
+        move.b  (a0)+,d0                ; x
         cmpi.b  #$FF,d1
-        beq.s   .next_coin
-
-        ; Check if visible (d3 <= y < d4)
-        ext.w   d1                      ; Extend to word
+        beq.s   .next                   ; collected
         cmp.w   d3,d1
-        blt.s   .next_coin              ; Below visible area
+        blt.s   .next
         cmp.w   d4,d1
-        bge.s   .next_coin              ; Above visible area
-
-        ; Inline tile copy (eliminates bsr/rts + movem overhead)
-        ; Calculate buffer address: buf + tile_y * 384 + tile_x * 4
-        ext.w   d0                      ; Extend x to word
-        move.w  d1,d2
-        lsl.w   #8,d2                   ; d2 = tile_y * 256
-        lsl.w   #7,d1                   ; d1 = tile_y * 128
-        add.w   d1,d2                   ; d2 = tile_y * 384
-        lsl.w   #2,d0                   ; d0 = tile_x * 4
-        add.w   d0,d2                   ; d2 = buffer offset
+        bge.s   .next
+        ifd PROFILE
+        lea     prof_tilesanim(pc),a1
+        addq.b  #1,(a1)
+        endif
+        lsl.w   #2,d0                   ; x*4
+        lsl.w   #7,d1                   ; y*128
+        add.w   d1,d0
+        add.w   d1,d1                   ; y*256
+        add.w   d1,d0                   ; x*4 + y*384
         lea     playfield_buf(pc),a1
-        adda.w  d2,a1                   ; a1 = buffer destination
-
-        ; Copy 8 rows using indexed addressing (a2 = tile base, constant)
-        move.l  (a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  4(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  8(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  12(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  16(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  20(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  24(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  28(a2),(a1)
-
-.next_coin:
-        dbra    d5,.coin_loop
-
-.done:
-        movem.l (sp)+,d0-d5/a0-a2
+        adda.w  d0,a1
+        move.l  d5,(a1)
+        move.l  d6,BUF_STRIDE(a1)
+        move.l  d7,BUF_STRIDE*2(a1)
+        move.l  a2,BUF_STRIDE*3(a1)
+        move.l  a3,BUF_STRIDE*4(a1)
+        move.l  a4,BUF_STRIDE*5(a1)
+        move.l  a5,BUF_STRIDE*6(a1)
+        move.l  a6,BUF_STRIDE*7(a1)
+.next:
+        dbra    d2,.loop
         rts
 
 ; ============================================================
@@ -2930,73 +3083,21 @@ update_exit_animation:
 
 ; ============================================================
 ; refresh_exit_tiles - Re-render visible TILE_EXIT tiles to buffer
-; Inlined tile copy, pre-computed tile address in a2
+; Passes exit_cache + the current TILE_EXIT image (a1) to refresh_tile_list
 ; ============================================================
 refresh_exit_tiles:
-        movem.l d0-d5/a0-a2,-(sp)
-
-        ; Calculate visible tile range based on window_y
-        move.w  window_y(pc),d3
-        lsr.w   #3,d3                   ; d3 = first visible tile row
-        move.w  d3,d4
-        addi.w  #PLAY_H,d4              ; d4 = last visible tile row (exclusive)
-
-        ; Pre-compute expanded tile address (constant for all exits)
-        lea     expanded_tiles(pc),a2
-        adda.w  #TILE_EXIT*32,a2        ; a2 = expanded TILE_EXIT source
-
-        ; Iterate through cached exit positions
-        move.w  num_cached_exits(pc),d5
-        beq.s   .exit_done              ; No exits cached
-        subq.w  #1,d5                   ; Adjust for dbra
+        move.w  num_cached_exits(pc),d2
+        beq.s   .re_out
+        movem.l d0-d7/a0-a6,-(sp)
+        ifd PROFILE
+        lea     prof_flags(pc),a1
+        bset    #1,(a1)
+        endif
         lea     exit_cache(pc),a0
-
-.exit_loop:
-        ; Load y,x from cache
-        move.b  (a0)+,d1                ; d1 = tile_y
-        move.b  (a0)+,d0                ; d0 = tile_x
-
-        ; Check if visible (d3 <= y < d4)
-        ext.w   d1                      ; Extend to word
-        cmp.w   d3,d1
-        blt.s   .exit_next              ; Below visible area
-        cmp.w   d4,d1
-        bge.s   .exit_next              ; Above visible area
-
-        ; Inline tile copy (eliminates bsr/rts + movem overhead)
-        ; Calculate buffer address: buf + tile_y * 384 + tile_x * 4
-        ext.w   d0                      ; Extend x to word
-        move.w  d1,d2
-        lsl.w   #8,d2                   ; d2 = tile_y * 256
-        lsl.w   #7,d1                   ; d1 = tile_y * 128
-        add.w   d1,d2                   ; d2 = tile_y * 384
-        lsl.w   #2,d0                   ; d0 = tile_x * 4
-        add.w   d0,d2                   ; d2 = buffer offset
-        lea     playfield_buf(pc),a1
-        adda.w  d2,a1                   ; a1 = buffer destination
-
-        ; Copy 8 rows using indexed addressing (a2 = tile base, constant)
-        move.l  (a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  4(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  8(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  12(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  16(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  20(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  24(a2),(a1)
-        adda.w  #BUF_STRIDE,a1
-        move.l  28(a2),(a1)
-
-.exit_next:
-        dbra    d5,.exit_loop
-
-.exit_done:
-        movem.l (sp)+,d0-d5/a0-a2
+        lea     expanded_tiles+TILE_EXIT*32(pc),a1
+        bsr     refresh_tile_list
+        movem.l (sp)+,d0-d7/a0-a6
+.re_out:
         rts
 
 ; ============================================================
@@ -3028,6 +3129,7 @@ find_hero_start:
         move.w  #LEVEL_W*LEVEL_H-1,d4   ; d4 = loop counter
 
 .scan_loop:
+        POLL
         move.b  (a0),d0
 
         ; Check for TILE_HERO_START (31) - primary hero
@@ -3277,14 +3379,9 @@ init_enemies:
         clr.l   (a0)+               ; Clear frame + delay
         dbra    d0,.clear_loop
 
-        ; Clear enemy count and composite addresses
+        ; Clear enemy count
         lea     num_enemies(pc),a0
         clr.w   (a0)
-        lea     enemy_buf_addrs(pc),a0
-        clr.l   (a0)+
-        clr.l   (a0)+
-        clr.l   (a0)+
-        clr.l   (a0)
 
         ; Scan level for enemy tiles
         move.l  level_data_ptr(pc),a1   ; a1 = level data
@@ -3295,6 +3392,7 @@ init_enemies:
 .scan_rows:
         moveq   #0,d0                   ; d0 = x coordinate
 .scan_cols:
+        POLL
         ; FIX: Clear d2 before byte read to ensure clean word value
         moveq   #0,d2
         move.b  (a1),d2                 ; d2 = tile type (now full word is clean)
@@ -3393,11 +3491,6 @@ build_cannon_list:
         clr.w   (a0)+
         dbra    d0,.clear_bullets
 
-        ; Clear bullet composite addresses
-        lea     bullet_buf_addrs(pc),a0
-        clr.l   (a0)+
-        clr.l   (a0)
-
         ; Get pointer to cannon list
         lea     cannon_list(pc),a1
 
@@ -3408,6 +3501,7 @@ build_cannon_list:
         move.w  #LEVEL_SIZE-1,d4        ; d4 = loop counter
 
 .cannon_scan_loop:
+        POLL
         move.b  (a0)+,d0                ; Get tile type
         cmpi.b  #TILE_CANNON_R,d0
         beq.s   .found_cannon_right
@@ -3596,7 +3690,7 @@ spawn_bullet:
         rts
 
 ; ============================================================
-; do_bullets - Move bullets every frame (50Hz)
+; do_bullets - Move bullets once per game frame (25 Hz)
 ; Bullets pass through cannons but stop at solid tiles
 ; ============================================================
 do_bullets:
@@ -3606,7 +3700,7 @@ do_bullets:
         move.w  bullet_count(pc),d0
         beq     .bullet_done
 
-        ; Move bullets every frame (50Hz)
+        ; Move bullets once per game frame (25 Hz)
         lea     bullet_list(pc),a1
         moveq   #MAX_BULLETS-1,d3
 
@@ -3749,11 +3843,11 @@ check_bullet_collision:
 ; ============================================================
 ; process_tile_effects - Unified tile effect handler (X16)
 ; Input: d5 = hero_x, d6 = hero_y
-; Returns: d0 = 1 if level complete (on active exit), 0 otherwise
+; Returns: d0 = 1 if hero is on an active exit (exit anim started/running), 0 otherwise
 ; ============================================================
 ; OPTIMIZATIONS:
 ;   - Single tile lookup handles all tile types
-;   - Sets level_complete_flag (main loop checks flag, no re-lookup)
+;   - Starts the hero exit anim; complete_hero_exit sets level_complete_flag
 ;   - Common coin code factored to reduce code size
 ;   - Saves ~140 cycles per step vs X15 approach
 ; ============================================================
@@ -3880,135 +3974,6 @@ process_tile_effects:
         rts
 
 ; ============================================================
-; composite_bullets_to_buffer - Draw bullets into buffer
-; Saves background first, then draws bullet sprite.
-; Called after composite_enemies, before composite_hero.
-; ============================================================
-composite_bullets_to_buffer:
-        movem.l d0-d5/a0-a3,-(sp)
-
-        ; Check if there are any active bullets
-        move.w  bullet_count(pc),d0
-        beq     .comp_done
-
-        ; Load window_y once - use d5 for scratch to preserve d4
-        move.w  window_y(pc),d4         ; d4 = window_y (pixels) - preserved
-
-        ; Pointers for save data
-        lea     bullet_buf_addrs(pc),a2
-        lea     bullet_buf_saves(pc),a3
-
-        ; Iterate through all bullet slots
-        lea     bullet_list(pc),a1
-        moveq   #MAX_BULLETS-1,d3
-
-.comp_loop:
-        ; Check if bullet is active
-        tst.w   BULLET_ACTIVE(a1)
-        beq.s   .next_comp
-
-        ; Get bullet position
-        move.w  BULLET_X(a1),d0         ; Grid X
-        move.w  BULLET_Y(a1),d1         ; Grid Y
-
-        ; Convert to buffer pixel position
-        ; buffer_pixel_y = bullet_y * 8
-        move.w  d1,d2
-        lsl.w   #3,d2                   ; d2 = bullet_y * 8 (pixels in buffer)
-
-        ; Check visibility: is bullet_y*8 within window_y to window_y+VIEW_HEIGHT_PX?
-        move.w  d2,d1
-        sub.w   d4,d1                   ; d1 = screen_pixel_y
-        bmi.s   .next_comp              ; Above visible area
-        cmpi.w  #VIEW_HEIGHT_PX-7,d1
-        bgt.s   .next_comp              ; Below visible area
-
-        ; Calculate buffer address using d5 as scratch (preserves d4)
-        ; buf_addr = playfield_buf + bullet_y * 8 * BUF_STRIDE + bullet_x * 4
-        ; = playfield_buf + bullet_y * 384 + bullet_x * 4
-        move.w  d2,d1                   ; d1 = bullet_y * 8
-        lsl.w   #4,d1                   ; d1 = bullet_y * 128
-        move.w  d2,d5
-        lsl.w   #5,d5                   ; d5 = bullet_y * 256
-        add.w   d5,d1                   ; d1 = bullet_y * 384
-        move.w  d0,d5
-        lsl.w   #2,d5                   ; d5 = bullet_x * 4
-        add.w   d5,d1                   ; d1 = buffer offset
-
-        lea     playfield_buf(pc),a0
-        adda.w  d1,a0                   ; a0 = buffer address for bullet
-
-        ; Save buffer address for restore
-        move.l  a0,(a2)
-
-        ; Offset to center rows (rows 3-4)
-        lea     BUF_STRIDE*3(a0),a0
-
-        ; Save background (2 rows × 4 bytes = 8 bytes for 1-tile width)
-        move.l  (a0),(a3)+              ; Row 3
-        move.l  BUF_STRIDE(a0),(a3)+    ; Row 4
-
-        ; Draw bullet sprite (8 pixels wide = 1 tile, white)
-        move.l  #$AAAAAAAA,(a0)         ; Row 3 (full tile width white)
-        move.l  #$AAAAAAAA,BUF_STRIDE(a0) ; Row 4
-
-        bra.s   .advance_comp
-
-.next_comp:
-        ; Don't clear buf_addr here - let restore handle it
-        addq.l  #8,a3                   ; Skip save space (8 bytes)
-
-.advance_comp:
-        addq.l  #4,a2                   ; Next address slot
-        lea     BULLET_SIZE(a1),a1
-        dbra    d3,.comp_loop
-
-.comp_done:
-        movem.l (sp)+,d0-d5/a0-a3
-        rts
-
-; ============================================================
-; restore_buffer_under_bullets - Restore buffer after screen copy
-; Called after restore_buffer_under_hero, before restore_buffer_under_enemies.
-; Unrolled for MAX_BULLETS=2 (eliminates dbra overhead)
-; ============================================================
-restore_buffer_under_bullets:
-        movem.l d0/a0-a2,-(sp)
-
-        ; Must check ALL slots for non-zero buf_addr from bullets
-        ; that were drawn last frame but have since deactivated
-
-        ; Pointers for save data
-        lea     bullet_buf_addrs(pc),a1
-        lea     bullet_buf_saves(pc),a2
-
-        ; --- Slot 0 (unrolled) ---
-        move.l  (a1)+,a0
-        move.l  a0,d0
-        beq.s   .slot0_skip
-        clr.l   -4(a1)                  ; Clear buf_addr
-        lea     BUF_STRIDE*3(a0),a0     ; Offset to center rows
-        move.l  (a2)+,(a0)              ; Restore row 3
-        move.l  (a2)+,BUF_STRIDE(a0)    ; Restore row 4
-        bra.s   .slot1
-.slot0_skip:
-        addq.l  #8,a2                   ; Skip save data
-
-        ; --- Slot 1 (unrolled) ---
-.slot1:
-        move.l  (a1)+,a0
-        move.l  a0,d0
-        beq.s   .rest_done
-        clr.l   -4(a1)                  ; Clear buf_addr
-        lea     BUF_STRIDE*3(a0),a0     ; Offset to center rows
-        move.l  (a2)+,(a0)              ; Restore row 3
-        move.l  (a2)+,BUF_STRIDE(a0)    ; Restore row 4
-
-.rest_done:
-        movem.l (sp)+,d0/a0-a2
-        rts
-
-; ============================================================
 ; Console I/O
 ; ============================================================
 open_console:
@@ -4055,6 +4020,7 @@ con_id: dc.l    0
 ; ============================================================
 clear_screen:
         movem.l d0/a0,-(sp)
+        bsr     score_digits_invalidate
         lea     SCREEN_BASE,a0
         move.w  #(32768/4)-1,d0
 .clear:
@@ -4073,6 +4039,7 @@ BG_MID_CLEAR    equ SCREEN_STRIDE-BG_BYTES_PER_ROW-BG_BYTES_PER_ROW  ; 68 bytes
 
 clear_screen_preserve_sides:
         movem.l d0-d1/a0,-(sp)
+        bsr     score_digits_invalidate
         moveq   #0,d0
 
         ; Part 1: Clear rows 0 to BG_START_ROW-1 (full width)
@@ -4084,9 +4051,11 @@ clear_screen_preserve_sides:
 
         ; Part 2: Clear middle of rows BG_START_ROW to BG_END_ROW-1
         ; Skip left 30 bytes, clear 68 bytes, skip right 30 bytes
+        POLL
         lea     SCREEN_BASE+(BG_START_ROW*SCREEN_STRIDE)+BG_BYTES_PER_ROW,a0
         move.w  #VIEW_HEIGHT_PX-1,d1                    ; 191
 .clr_mid_row:
+        POLL
         ; Clear 68 bytes = 17 longwords
         move.l  d0,(a0)+
         move.l  d0,(a0)+
@@ -4111,6 +4080,7 @@ clear_screen_preserve_sides:
         dbra    d1,.clr_mid_row
 
         ; Part 3: Clear rows BG_END_ROW to 255 (full width)
+        POLL
         lea     SCREEN_BASE+(BG_END_ROW*SCREEN_STRIDE),a0
         move.w  #((256-BG_END_ROW)*SCREEN_STRIDE/4)-1,d1  ; 32*128/4 - 1 = 1023
 .clr_bot:
@@ -4133,6 +4103,7 @@ black_playfield:
         moveq   #0,d0
         move.w  #VIEW_HEIGHT_PX-1,d1    ; 191
 .bp_row:
+        POLL
         ; Clear 56 bytes = 14 longwords (left col + playfield + right col)
         move.l  d0,(a0)+
         move.l  d0,(a0)+
@@ -4163,6 +4134,10 @@ black_playfield:
 ; ============================================================
 render_tile_to_buffer:
         movem.l d0-d3/a0-a1,-(sp)
+        ifd PROFILE
+        lea     prof_tiles(pc),a0
+        addq.b  #1,(a0)
+        endif
 
         ; Calculate buffer address: buf + tile_y * 384 + tile_x * 4
         ; tile_y * 384 = tile_y * 256 + tile_y * 128
@@ -4204,7 +4179,7 @@ render_tile_to_buffer:
 
 ; ============================================================
 ; render_playfield_to_buffer - Render entire level to buffer
-; Called once when level loads
+; Called on level load/restart and title setup
 ; ============================================================
 render_playfield_to_buffer:
         movem.l d0-d5/a0-a3,-(sp)
@@ -4216,6 +4191,7 @@ render_playfield_to_buffer:
         moveq   #0,d4                   ; d4 = tile_y counter
 
 .row_loop:
+        POLL
         moveq   #LEVEL_W-1,d5           ; d5 = tile_x counter
         move.l  a0,a1                   ; a1 = row start in buffer
 
@@ -4266,11 +4242,11 @@ render_playfield_to_buffer:
 ; copy_window_to_screen - Copy visible slice from buffer to screen
 ; Uses window_y (pixels) to determine which part to copy
 ; Copies 192 scanlines (VIEW_HEIGHT_PX) from buffer to screen
-; 11 regs (d0-d6/a2-a5) = 44 bytes + move.l 4 bytes = 48 bytes
-; A6 preserved for QDOS system variables (required by IPC beeper)
+; 12 regs (d0-d7/a2-a5) = 48 bytes: one movem pair per line, fully unrolled
+; A6 not used by the blit (saved/restored with the rest)
 ; ============================================================
 copy_window_to_screen:
-        movem.l d0-d7/a0-a5,-(sp)       ; A6 not used in blit
+        movem.l d0-d7/a0-a6,-(sp)
 
         ; Get window_y and clamp to valid range
         move.w  window_y(pc),d0
@@ -4293,55 +4269,21 @@ copy_window_to_screen:
         ; Destination: screen playfield area
         lea     PLAYFIELD_BASE,a1
 
-        ; 8x unrolled loop (192/8 = 24 iterations)
-        ; 11 regs (d0-d6/a2-a5) = 44 bytes + move.l 4 bytes = 48 bytes/line
-        moveq   #23,d7              ; 24 iterations of 8 lines each
+        ; Fully unrolled: one line = one 12-register movem pair (48 bytes).
+        ; Every destination line is a constant displacement from a1
+        ; (191*128 = 24448 < 32768), so no adda, no counter, no tail move.
+        ; A6 is saved above: nothing in the blit needs QDOS.
+CW_LINE set 0
+        rept    VIEW_HEIGHT_PX
+        movem.l (a0)+,d0-d7/a2-a5
+        movem.l d0-d7/a2-a5,CW_LINE*SCREEN_STRIDE(a1)
+        if (CW_LINE-(CW_LINE/48)*48)=47
+        POLL                            ; no registers used
+        endif
+CW_LINE set CW_LINE+1
+        endr
 
-.copy_8lines:
-        ; Line 0 (48 bytes via 11-reg movem + move.l)
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 1
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 2
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 3
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 4
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 5
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 6
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-        ; Line 7
-        movem.l (a0)+,d0-d6/a2-a5
-        movem.l d0-d6/a2-a5,(a1)
-        move.l  (a0)+,44(a1)
-        adda.w  #SCREEN_STRIDE,a1
-
-        dbra    d7,.copy_8lines
-
-        movem.l (sp)+,d0-d7/a0-a5       ; Restore (A6 untouched)
+        movem.l (sp)+,d0-d7/a0-a6
         rts
 
 ; ============================================================
@@ -4376,6 +4318,7 @@ copy_window_to_screen_title:
         ; These appear at screen rows 32-71 (above logo)
         moveq   #4,d7
 .copy_part1:
+        POLL
         movem.l (a0)+,d0-d6/a2-a5
         movem.l d0-d6/a2-a5,(a1)
         move.l  (a0)+,44(a1)
@@ -4420,6 +4363,7 @@ copy_window_to_screen_title:
         ; These appear at screen rows 104-223 (below logo)
         moveq   #14,d7
 .copy_part2:
+        POLL
         movem.l (a0)+,d0-d6/a2-a5
         movem.l d0-d6/a2-a5,(a1)
         move.l  (a0)+,44(a1)
@@ -4506,6 +4450,10 @@ init_outro:
         ; Set game state
         lea     game_state(pc),a0
         move.w  #GS_OUTRO,(a0)
+
+        moveq   #MUSIC_OUTRO,d0
+        movea.l music_start_ptr(pc),a0
+        jsr     (a0)
 
         ; Clear entire playfield buffer
         lea     playfield_buf(pc),a0
@@ -4638,9 +4586,11 @@ outro_loop:
         ; Draw thanks text before playfield copy to push the heavy
         ; copy later, giving the CRT beam more head start
         ; Columns are static (drawn once in init_outro), not redrawn
+        POLL
         bsr     draw_outro_thanks
 
         ; Copy buffer to screen (reduced: skips blank top/bottom rows)
+        POLL
         bsr     copy_outro_to_screen
 
         ; Decrement outro delay counter
@@ -4733,6 +4683,7 @@ copy_outro_to_screen:
         moveq   #19,d7              ; 20 iterations
 
 .copy_8lines:
+        POLL
         movem.l (a0)+,d0-d6/a2-a5
         movem.l d0-d6/a2-a5,(a1)
         move.l  (a0)+,44(a1)
@@ -4841,7 +4792,7 @@ draw_outro_thanks:
 ; draw_bullets_to_screen - Draw bullets directly to screen
 ; Called AFTER copy_window_to_screen. No save/restore needed since
 ; buffer is never modified - fresh copy each frame overwrites old bullets.
-; Much simpler than composite_bullets_to_buffer: just calc screen addr and draw.
+; Drawn straight to the screen: just calc screen addr and draw.
 ; ============================================================
 draw_bullets_to_screen:
         move.w  bullet_count(pc),d0
@@ -5053,7 +5004,7 @@ BG_START_ROW     equ PLAY_Y*TILE_HEIGHT              ; 32
 draw_side_images:
         movem.l d0-d7/a0-a5,-(sp)
 
-        ; Image data is beyond PC-relative range (after 24KB playfield_buf).
+        ; Image data sits in the init-only area at the start of playfield_buf; the 32-bit offset is a leftover from when it was out of PC-relative range.
         ; Use PC trick: get our own address, then add 32-bit offset.
         pea     .pc_ref(pc)
         move.l  (sp)+,a2                ; a2 = runtime address of .pc_ref
@@ -5415,7 +5366,7 @@ composite_hero2_to_buffer:
         ; Hero2 is visible - NOW save registers and do the work
         movem.l d0-d3/a0-a2,-(sp)
 
-        ; a0 was clobbered by movem, recalculate slot address
+        ; d0 now holds screen_y and a0 is reused: recalculate slot address into a1
         move.w  active_hero(pc),d0
         eori.w  #1,d0                   ; d0 = inactive hero index
         move.w  d0,d1
@@ -5460,7 +5411,7 @@ composite_hero2_to_buffer:
         move.w  HERO_SLOT_FLY(a1),d2    ; d2 = fly flag
         bsr     get_hero_sprite_for_dir ; a2 = sprite address
 
-        ; Draw sprite with GREEN color mask (strips red bits)
+        ; Draw sprite with GREEN color mask (strips red and blue bits)
         ; $FF00FF00 keeps green plane, removes red plane from each word
         move.l  #$FF00FF00,d3           ; d3 = green mask (preserved in movem)
         move.l  (a2)+,d0
@@ -5554,73 +5505,42 @@ composite_enemies_to_buffer:
         move.w  num_enemies(pc),d0
         beq     .exit
 
-        movem.l d0-d7/a0-a5,-(sp)        ; FIX: Added d7, skip d5 in data ops
+        movem.l d0-d6/a0-a1/a4,-(sp)
 
         lea     enemy_slots(pc),a1
-        lea     enemy_buf_addrs(pc),a2
-        lea     enemy_buf_saves(pc),a3
         moveq   #MAX_ENEMIES-1,d5
 
 .comp_loop:
         tst.w   (a1)                    ; Check active
-        beq     .next_comp
+        beq.s   .next_comp
 
-        ; Get enemy position from tile coordinates
-        move.w  2(a1),d0                ; d0 = tile X
+        ; Any row on screen? screen_y = y*8 - window_y in [-7, 191]
         move.w  4(a1),d1                ; d1 = tile Y
-
-        ; Check if enemy is visible
-        ; screen_pixel_y = enemy_y * 8 - window_y
         move.w  d1,d2
-        lsl.w   #3,d2                   ; d2 = enemy_y * 8
-        sub.w   window_y(pc),d2         ; d2 = screen_pixel_y
-        bmi     .next_comp              ; Above visible area
-        cmpi.w  #VIEW_HEIGHT_PX-7,d2
-        bgt     .next_comp              ; Below visible area
+        lsl.w   #3,d2
+        sub.w   window_y(pc),d2
+        addq.w  #7,d2
+        cmpi.w  #VIEW_HEIGHT_PX+7-1,d2
+        bhi.s   .next_comp              ; wholly above or below the window
 
-        ; Calculate buffer address using tile position
-        ; Buffer Y offset = tile_y * 384
+        ; Buffer address = playfield_buf + y*384 + x*4
         move.w  d1,d3
-        ; d3 * 48 = d3 * 32 + d3 * 16 (no mulu for speed)
+        lsl.w   #7,d3                   ; y*128
         move.w  d3,d4
-        lsl.w   #5,d3                   ; d3 = y * 32
-        lsl.w   #4,d4                   ; d4 = y * 16
+        add.w   d4,d4                   ; y*256
+        add.w   d4,d3                   ; y*384
+        move.w  2(a1),d4
+        lsl.w   #2,d4
         add.w   d4,d3
-        lsl.w   #3,d3                   ; d3 = y * 48 * 8 = y * 384
-
-        ; X offset from tile position: tile_x * 4 (bytes)
-        move.w  d0,d4
-        lsl.w   #2,d4                   ; d4 = tile_x * 4
-        add.w   d4,d3                   ; d3 = buffer offset
-
         lea     playfield_buf(pc),a0
-        adda.w  d3,a0                   ; a0 = buffer address
+        adda.w  d3,a0
 
-        ; Save buffer address for restore
-        move.l  a0,(a2)
+        ifd PROFILE
+        lea     prof_enem(pc),a4
+        addq.b  #1,(a4)
+        endif
+        bsr     get_enemy_sprite        ; a4 = sprite (clobbers d4, d6)
 
-        ; Save background (direct memory-to-memory, no register intermediary)
-        move.l  (a0),(a3)+
-        move.l  4(a0),(a3)+
-        move.l  BUF_STRIDE(a0),(a3)+
-        move.l  BUF_STRIDE+4(a0),(a3)+
-        move.l  BUF_STRIDE*2(a0),(a3)+
-        move.l  BUF_STRIDE*2+4(a0),(a3)+
-        move.l  BUF_STRIDE*3(a0),(a3)+
-        move.l  BUF_STRIDE*3+4(a0),(a3)+
-        move.l  BUF_STRIDE*4(a0),(a3)+
-        move.l  BUF_STRIDE*4+4(a0),(a3)+
-        move.l  BUF_STRIDE*5(a0),(a3)+
-        move.l  BUF_STRIDE*5+4(a0),(a3)+
-        move.l  BUF_STRIDE*6(a0),(a3)+
-        move.l  BUF_STRIDE*6+4(a0),(a3)+
-        move.l  BUF_STRIDE*7(a0),(a3)+
-        move.l  BUF_STRIDE*7+4(a0),(a3)+
-
-        ; Get sprite address based on direction and frame
-        bsr     get_enemy_sprite        ; Returns a4 = sprite address
-
-        ; Draw sprite (direct memory-to-memory, no register intermediary)
         move.l  (a4)+,(a0)
         move.l  (a4)+,4(a0)
         move.l  (a4)+,BUF_STRIDE(a0)
@@ -5637,73 +5557,43 @@ composite_enemies_to_buffer:
         move.l  (a4)+,BUF_STRIDE*6+4(a0)
         move.l  (a4)+,BUF_STRIDE*7(a0)
         move.l  (a4)+,BUF_STRIDE*7+4(a0)
-        bra.s   .next_comp2
 
 .next_comp:
-        ; No enemy composited - clear buffer addr, advance save ptr
-        clr.l   (a2)
-        adda.w  #64,a3                  ; Skip save area
-.next_comp2:
-        addq.l  #4,a2                   ; Next buffer addr slot
-        adda.w  #ENEMY_SLOT_SIZE,a1     ; Next enemy slot
+        adda.w  #ENEMY_SLOT_SIZE,a1
         dbra    d5,.comp_loop
 
-        movem.l (sp)+,d0-d7/a0-a5       ; FIX: Added d7
+        movem.l (sp)+,d0-d6/a0-a1/a4
 .exit:
         rts
 
 ; ============================================================
-; restore_buffer_under_enemies - Restore buffer after copy
+; PERSISTENT BATS
+; Bats are drawn into the buffer every frame and left there: no save,
+; no restore.  When a bat moves, the tile it vacates is re-rendered from
+; the level (rerender_bat_tile).  Everything that can be drawn under a
+; bat (trails, animated coin/exit tiles) is redrawn before the bats each
+; frame, and the heroes still save/restore over them, so the buffer is
+; always right.  A bat partly on screen is drawn too (it used to pop in).
 ; ============================================================
 restore_buffer_under_enemies:
-        move.w  num_enemies(pc),d0
-        beq     .exit
+        rts
 
-        movem.l d0-d7/a0-a3,-(sp)       ; OPT: More regs for movem.l
-
-        lea     enemy_buf_addrs(pc),a1
-        lea     enemy_buf_saves(pc),a2
-        moveq   #MAX_ENEMIES-1,d1
-
-.rest_loop:
-        move.l  (a1)+,a0                ; Get saved buffer address
-        move.l  a0,d0
-        beq.s   .skip_restore           ; No enemy was composited here
-
-        ; Restore background (direct memory-to-memory, no register intermediary)
-        move.l  (a2)+,(a0)
-        move.l  (a2)+,4(a0)
-        move.l  (a2)+,BUF_STRIDE(a0)
-        move.l  (a2)+,BUF_STRIDE+4(a0)
-        move.l  (a2)+,BUF_STRIDE*2(a0)
-        move.l  (a2)+,BUF_STRIDE*2+4(a0)
-        move.l  (a2)+,BUF_STRIDE*3(a0)
-        move.l  (a2)+,BUF_STRIDE*3+4(a0)
-        move.l  (a2)+,BUF_STRIDE*4(a0)
-        move.l  (a2)+,BUF_STRIDE*4+4(a0)
-        move.l  (a2)+,BUF_STRIDE*5(a0)
-        move.l  (a2)+,BUF_STRIDE*5+4(a0)
-        move.l  (a2)+,BUF_STRIDE*6(a0)
-        move.l  (a2)+,BUF_STRIDE*6+4(a0)
-        move.l  (a2)+,BUF_STRIDE*7(a0)
-        move.l  (a2)+,BUF_STRIDE*7+4(a0)
-        bra.s   .next_rest
-
-.skip_restore:
-        adda.w  #64,a2                  ; Skip save area
-
-.next_rest:
-        dbra    d1,.rest_loop
-
-        ; Clear all buffer addresses
-        lea     enemy_buf_addrs(pc),a0
-        clr.l   (a0)+
-        clr.l   (a0)+
-        clr.l   (a0)+
-        clr.l   (a0)
-
-        movem.l (sp)+,d0-d7/a0-a3       ; OPT: Restore more regs
-.exit:
+; rerender_bat_tile - re-render level tile (d0 = x, d3 = y); all preserved
+rerender_bat_tile:
+        movem.l d0-d2/a0,-(sp)
+        cmpi.w  #LEVEL_W,d0
+        bhs.s   .out                    ; off the level (unsigned: also < 0)
+        move.w  d3,d1
+        move.w  d3,d2
+        add.w   d2,d2
+        add.w   d3,d2                   ; y*3
+        lsl.w   #2,d2                   ; y*12
+        add.w   d0,d2
+        movea.l level_data_ptr(pc),a0
+        move.b  0(a0,d2.w),d2
+        bsr     render_tile_to_buffer   ; d0 = x, d1 = y, d2 = tile
+.out:
+        movem.l (sp)+,d0-d2/a0
         rts
 
 ; ============================================================
@@ -5864,7 +5754,7 @@ update_enemies:
 
 .enemy_loop:
         tst.w   (a1)                    ; Check active
-        beq.s   .next_enemy
+        beq     .next_enemy
 
         ; Decrement per-enemy delay counter
         move.w  10(a1),d0               ; d0 = delay counter
@@ -5903,8 +5793,13 @@ update_enemies:
         tst.w   d6
         bne.s   .reverse_to_left        ; Solid, reverse
 
-        ; Move right
+        ; Move right: the bat leaves tile (X-1) of its new position
         move.w  d2,2(a1)                ; Store new X
+        move.l  d0,-(sp)
+        move.w  d2,d0
+        subq.w  #1,d0
+        bsr     rerender_bat_tile       ; d0 = x, d3 = y
+        move.l  (sp)+,d0
         bra.s   .store_delay
 
 .reverse_to_left:
@@ -5923,8 +5818,13 @@ update_enemies:
         tst.w   d6
         bne.s   .reverse_to_right       ; Solid, reverse
 
-        ; Move left
+        ; Move left: the bat leaves tile (X+2) of its new position
         move.w  d2,2(a1)                ; Store new X
+        move.l  d0,-(sp)
+        move.w  d2,d0
+        addq.w  #2,d0
+        bsr     rerender_bat_tile       ; d0 = x, d3 = y
+        move.l  (sp)+,d0
         bra.s   .store_delay
 
 .reverse_to_right:
@@ -5948,16 +5848,17 @@ update_enemies:
 
 ; Check if tile at (d7,d3) is solid
 ; FIX: Changed from d5 to d7 (d5 is loop counter)
+; Uses a0 (a2 holds the loop's early-exit count; a1 the slot)
 ; Returns d6 = 1 if solid, 0 if passable
 ; OPT: mulu #12 -> shifts (y*3*4 = y*12)
 .check_tile_solid:
-        move.l  level_data_ptr(pc),a2
+        move.l  level_data_ptr(pc),a0
         move.w  d3,d6
         add.w   d6,d6                   ; d6 = y * 2
         add.w   d3,d6                   ; d6 = y * 3
         lsl.w   #2,d6                   ; d6 = y * 12
         add.w   d7,d6                   ; d6 = y * 12 + x (FIX: d7 not d5)
-        move.b  (a2,d6.w),d6
+        move.b  (a0,d6.w),d6
         ; Check if solid (tiles 28-30 are solid)
         cmpi.b  #TILE_UNHIDDEN,d6
         blt.s   .not_solid
@@ -6264,13 +6165,13 @@ update_camera:
 
         ; Coarse/fast scroll with overshoot fix
         ; if |diff| >= 256: step = 16 (was 8)
-        ; else: step = (|diff| >> 3) + 2  ; gives 2..34 (was 1..16)
+        ; else: step = (|diff| >> 3) + 1  ; gives 1..32 (was 1..16)
         cmpi.w  #256,d3
         bge.s   .use_speed_16
 
         move.w  d3,d4
         lsr.w   #3,d4               ; d4 = |diff| / 8 (was /16)
-        addq.w  #1,d4               ; step (1..33) - 1 pixel min scroll
+        addq.w  #1,d4               ; step (1..32) - 1 pixel min scroll
         bra.s   .clamp_step
 
 .use_speed_16:
@@ -6553,6 +6454,9 @@ update_hero_movement:
 ; read_keyboard
 ; ============================================================
 read_keyboard:
+        ifd POLLED
+        bra     read_keyboard_polled
+        endif
         movem.l d0-d3/a0,-(sp)
 
         move.l  con_id(pc),a0
@@ -6563,7 +6467,23 @@ read_keyboard:
         moveq   #0,d3
         trap    #3
         tst.l   d0
+        ifd AUTOPILOT
+        bpl.s   .real_key
+        bsr     prof_auto_key
+        tst.l   d0
+        bra.s   .key_checked
+.real_key:
+        ifd PROFILE
+        move.l  a0,-(sp)
+        lea     prof_flags(pc),a0
+        bset    #6,(a0)                 ; a key came from the QDOS queue
+        move.l  (sp)+,a0
+        endif
+        moveq   #0,d0
+.key_checked:
+        endif
         bmi     .done
+.got_key:
 
         cmpi.b  #27,d1
         beq     .quit
@@ -6578,6 +6498,8 @@ read_keyboard:
         cmpi.b  #'r',d1
         beq     .reset_lvl
         cmpi.b  #'R',d1
+        beq     .reset_lvl
+        cmpi.b  #10,d1                  ; ENTER also resets (as the polled build)
         beq     .reset_lvl
 
         ; Check for SPACE key to swap heroes
@@ -6670,12 +6592,6 @@ clear_trails:
         dbra    d0,.clear
         lea     active_trails(pc),a0
         clr.w   (a0)
-        ; Clear trail buffer save addresses
-        lea     trail_buf_addrs(pc),a0
-        moveq   #NUM_TRAIL_SLOTS-1,d0
-.clear_addrs:
-        clr.l   (a0)+
-        dbra    d0,.clear_addrs
         rts
 
 start_trail:
@@ -6721,71 +6637,73 @@ start_trail:
         rts
 
 ; ============================================================
-; composite_trails_to_buffer
-; Draws trail sprites into the playfield buffer (like hero/enemies)
-; so they are included in copy_window_to_screen without flicker.
-; Background is saved for later restore.
+; composite_trails_to_buffer - PERSISTENT trails
+; Trails are drawn straight into the playfield buffer and stay there:
+; no background save, no restore.  When a trail expires its LEVEL tile is
+; re-rendered, which is also correct if that tile changed while the trail
+; was alive (a hidden block turning solid is written to the level first).
+; Pass 1 expires trails BEFORE pass 2 draws, so an expiring trail can never
+; erase a newer live trail on the same tile.  Sprites composited later
+; (bats, heroes) draw over the trail pixels; heroes save/restore, bats are persistent (no save).
 ; ============================================================
 composite_trails_to_buffer:
         move.w  active_trails(pc),d0
         beq     .exit
 
-        movem.l d0-d5/a0-a5,-(sp)
+        movem.l d0-d4/a0-a3,-(sp)
 
+        ; --- Pass 1: expire finished trails, restoring their level tile ---
         lea     trail_slots(pc),a3
-        lea     exp_trail_sprites(pc),a5
-        lea     trail_buf_addrs(pc),a4  ; a4 = save address array
-        lea     trail_buf_saves(pc),a2  ; a2 = save data array
-        moveq   #NUM_TRAIL_SLOTS-1,d5
-
-.loop:
+        moveq   #NUM_TRAIL_SLOTS-1,d4
+.expire:
         tst.w   (a3)
-        beq.s   .inactive
+        beq.s   .expire_next
+        movea.l 6(a3),a1
+        cmpi.b  #TRAIL_IDX_END,(a1)
+        bne.s   .expire_next
+        clr.w   (a3)
+        lea     active_trails(pc),a0
+        subq.w  #1,(a0)
+        move.w  2(a3),d0                ; x
+        move.w  4(a3),d1                ; y
+        move.w  d1,d2
+        add.w   d2,d2
+        add.w   d1,d2                   ; y*3
+        lsl.w   #2,d2                   ; y*12
+        add.w   d0,d2                   ; y*12 + x
+        movea.l level_data_ptr(pc),a0
+        move.b  0(a0,d2.w),d2           ; level tile (render masks to 0-31)
+        bsr     render_tile_to_buffer
+.expire_next:
+        lea     TRAIL_SLOT_SIZE(a3),a3
+        dbra    d4,.expire
 
-        ; Advance animation frame
-        move.l  6(a3),a1
+        ; --- Pass 2: draw live trails, advancing their animation ---
+        lea     trail_slots(pc),a3
+        lea     exp_trail_sprites(pc),a2
+        moveq   #NUM_TRAIL_SLOTS-1,d4
+.draw:
+        tst.w   (a3)
+        beq.s   .draw_next
+        movea.l 6(a3),a1
         moveq   #0,d0
-        move.b  (a1)+,d0
-        cmpi.b  #TRAIL_IDX_END,d0
-        beq.s   .slot_done
-
+        move.b  (a1)+,d0                ; sprite index (END handled in pass 1)
         move.l  a1,6(a3)
+        lsl.w   #5,d0
+        lea     0(a2,d0.w),a1           ; a1 = trail sprite
 
-        ; Get trail sprite address
-        lsl.w   #5,d0               ; d0 = sprite_index * 32
-        lea     (a5),a1
-        adda.w  d0,a1               ; a1 = trail sprite data
-
-        ; Calculate buffer address
-        ; buf_addr = playfield_buf + slot_y * (BUF_STRIDE*8) + slot_x * 4
-        ;          = playfield_buf + slot_y * 384 + slot_x * 4
-        move.w  4(a3),d0            ; d0 = slot_y (tiles)
+        ; buffer address = playfield_buf + y*384 + x*4
+        move.w  4(a3),d0
         move.w  d0,d1
-        lsl.w   #8,d1               ; d1 = slot_y * 256
-        lsl.w   #7,d0               ; d0 = slot_y * 128
-        add.w   d1,d0               ; d0 = slot_y * 384
-
-        move.w  2(a3),d1            ; d1 = slot_x
-        lsl.w   #2,d1               ; d1 = slot_x * 4
-        add.w   d1,d0               ; d0 = buffer offset
-
+        lsl.w   #8,d1
+        lsl.w   #7,d0
+        add.w   d1,d0
+        move.w  2(a3),d1
+        lsl.w   #2,d1
+        add.w   d1,d0
         lea     playfield_buf(pc),a0
-        adda.l  d0,a0               ; a0 = buffer address for trail
+        adda.w  d0,a0
 
-        ; Store buffer address for restore
-        move.l  a0,(a4)
-
-        ; Save background (8 longwords, BUF_STRIDE apart)
-        move.l  (a0),(a2)+
-        move.l  BUF_STRIDE(a0),(a2)+
-        move.l  BUF_STRIDE*2(a0),(a2)+
-        move.l  BUF_STRIDE*3(a0),(a2)+
-        move.l  BUF_STRIDE*4(a0),(a2)+
-        move.l  BUF_STRIDE*5(a0),(a2)+
-        move.l  BUF_STRIDE*6(a0),(a2)+
-        move.l  BUF_STRIDE*7(a0),(a2)+
-
-        ; Draw trail sprite into buffer
         move.l  (a1)+,(a0)
         move.l  (a1)+,BUF_STRIDE(a0)
         move.l  (a1)+,BUF_STRIDE*2(a0)
@@ -6794,76 +6712,17 @@ composite_trails_to_buffer:
         move.l  (a1)+,BUF_STRIDE*5(a0)
         move.l  (a1)+,BUF_STRIDE*6(a0)
         move.l  (a1)+,BUF_STRIDE*7(a0)
-        bra.s   .next
+.draw_next:
+        lea     TRAIL_SLOT_SIZE(a3),a3
+        dbra    d4,.draw
 
-.slot_done:
-        clr.w   (a3)
-        lea     active_trails(pc),a0
-        subq.w  #1,(a0)
-        ; Clear buf addr so restore skips this slot
-        clr.l   (a4)
-        ; Fall through to .inactive to advance a2
-
-.inactive:
-        ; Advance save data pointer to keep aligned with slot index
-        adda.w  #32,a2
-
-.next:
-        addq.l  #4,a4               ; Next save address slot
-        adda.w  #TRAIL_SLOT_SIZE,a3
-        dbra    d5,.loop
-
-        movem.l (sp)+,d0-d5/a0-a5
+        movem.l (sp)+,d0-d4/a0-a3
 .exit:
         rts
 
-; ============================================================
-; restore_buffer_under_trails
-; Restores buffer background under all composited trails.
-; Iterates in REVERSE order (slot 23->0) to correctly handle
-; overlapping trails. When two trails share the same buffer position,
-; the later-composited trail's save captured the earlier trail's sprite.
-; Restoring in reverse undoes composites in LIFO order, ensuring the
-; original clean background is restored last.
-; ============================================================
+; restore_buffer_under_trails - nothing to restore any more (trails are
+; persistent).  Kept as a stub for the title and win loops.
 restore_buffer_under_trails:
-        move.w  active_trails(pc),d0
-        beq     .exit
-
-        movem.l d0-d1/a0-a2,-(sp)
-
-        ; Start from the LAST slot and work backwards
-        lea     trail_buf_addrs(pc),a1
-        adda.w  #(NUM_TRAIL_SLOTS-1)*4,a1
-        lea     trail_buf_saves(pc),a2
-        adda.w  #(NUM_TRAIL_SLOTS-1)*32,a2
-        moveq   #NUM_TRAIL_SLOTS-1,d1
-
-.loop:
-        move.l  (a1),a0             ; a0 = saved buffer address
-        move.l  a0,d0
-        beq.s   .skip               ; No sprite was composited here
-
-        ; Restore background using explicit offsets (a2 = start of save block)
-        move.l  (a2),(a0)
-        move.l  4(a2),BUF_STRIDE(a0)
-        move.l  8(a2),BUF_STRIDE*2(a0)
-        move.l  12(a2),BUF_STRIDE*3(a0)
-        move.l  16(a2),BUF_STRIDE*4(a0)
-        move.l  20(a2),BUF_STRIDE*5(a0)
-        move.l  24(a2),BUF_STRIDE*6(a0)
-        move.l  28(a2),BUF_STRIDE*7(a0)
-
-        ; Clear address (one-shot restore)
-        clr.l   (a1)
-
-.skip:
-        suba.w  #4,a1               ; Previous buf_addr slot
-        suba.w  #32,a2              ; Previous save block
-        dbra    d1,.loop
-
-        movem.l (sp)+,d0-d1/a0-a2
-.exit:
         rts
 
 ; ============================================================
@@ -7276,6 +7135,311 @@ gameName_1bpp:
         dc.b    $06,$84,$00,$80,$00,$00,$08,$3c  ; Row 31
 
 ; ============================================================
+; WORLD-SPECIFIC BLOCK TILES (pre-expanded 4bpp)
+; These are copied to expanded_tiles at tiles 29-30 based on level
+; ============================================================
+
+; blocks1_tiles - Levels 1-10: Brick wall with offset rows
+; 1bpp Tile 29: $00,$F7,$F7,$F7,$00,$BF,$BF,$00
+; 1bpp Tile 30: $00,$F7,$F7,$F7,$00,$BF,$BF,$BF
+blocks1_tiles:
+        ; Tile 29 - blocks1
+        dc.l    $00000000,$00AA002A,$00AA80AA,$00AA002A
+        dc.l    $00000000,$009A00AA,$008A00AA,$00550055
+        ; Tile 30 - blocks1
+        dc.l    $00000000,$00AA002A
+        dc.l    $00AA80AA,$00AA002A
+        dc.l    $00000000,$008A00AA
+        dc.l    $20AA00AA,$008A00AA
+
+; blocks2_tiles - Levels 16+: Diagonal pattern
+; 1bpp Tile 29: $00,$7E,$7C,$7A,$00,$3C,$38,$34
+; 1bpp Tile 30: $00,$70,$F7,$77,$F7,$67,$D6,$05
+blocks2_tiles:
+        ; Tile 29 - blocks2
+        dc.l    $00000000,$003F00FC
+        dc.l    $003F00F0,$003F00CC
+        dc.l    $00550055,$000F00F0
+        dc.l    $000A0080,$000A0020
+        ; Tile 30 - blocks2
+        dc.l    $00000000,$002A0000
+        dc.l    $00AA002A,$003F003F
+        dc.l    $00FF003F,$003C003F
+        dc.l    $00F7007D,$00000033
+; blocks3_tiles - Levels 11-15: Different brick pattern
+; 1bpp Tile 29: $0E,$EA,$E0,$EE,$EA,$0E,$E0,$00
+; 1bpp Tile 30: $FA,$EC,$7E,$BA,$7C,$BE,$56,$00
+blocks3_tiles:
+        ; Tile 29 - blocks3
+        dc.l    $0000A8FC,$A8548844
+        dc.l    $A8FC0000,$A855A855
+        dc.l    $A8558855,$0000A854
+        dc.l    $A8FC0000,$00000000
+        ; Tile 30 - blocks3
+        dc.l    $AAFF88DD,$A8FDA0F5
+        dc.l    $2A7FA8FD,$8ADF88DD
+        dc.l    $2A7FA0F5,$8ADFA8FD
+        dc.l    $22FF28FF,$00000000
+
+; ============================================================
+; ALL LEVEL DATA
+; Levels are OTZ-packed; load_current_level finds a level via level_offsets
+;   (remapped index) and otz_decodes it into level_working.
+; ============================================================
+        include "levels_otz.inc"
+
+        even
+        ifd PROFILE
+        include "ot_profile.s"
+        even
+        endif
+        ifd POLLED
+        include "ot_polled.s"
+        even
+        endif
+
+; ============================================================
+; VARIABLES
+; ============================================================
+level_data_ptr:  dc.l 0         ; Stored base address for writes
+current_level:   dc.w 0         ; Current level index (0-20)
+coin_count:      dc.w 0         ; Collected coins this level
+coins_total:     dc.w 0         ; Total coins in level (for exit activation)
+level_complete_flag: dc.w 0    ; Set by process_tile_effects when on active exit
+heroes_exited:   dc.w 0         ; Bitmask: bit 0 = hero 0 exited, bit 1 = hero 1 exited
+
+; Hero exit animation
+hero_exit_active: dc.w 0        ; Flag: exit animation is playing
+hero_exit_frame:  dc.w 0        ; Current animation frame (0-6)
+hero_exit_delay:  dc.w 0        ; Delay counter between frames
+hero_exit_x:      dc.w 0        ; X position of exiting hero (grid)
+hero_exit_y:      dc.w 0        ; Y position of exiting hero (grid)
+hero_exit_hero_id: dc.w 0       ; Which hero is exiting (0 or 1)
+HERO_EXIT_ANIM_SPEED equ 4      ; Frames between animation updates
+
+game_state:      dc.w GS_GAMEPLAY  ; Current game state
+win_flash_ctr:   dc.w 0         ; Counter for "PRESS SPACE" flash
+; Title screen variables
+title_flash_ctr:   dc.w 0       ; Counter for "PUSH FIRE" flash
+title_text_visible: dc.w 1      ; 1 = text visible, 0 = hidden
+; Outro bounce animation variables
+outro_bounce_idx:   dc.w 0      ; Current index into bounce table (0-7)
+outro_bounce_frame: dc.w 0      ; Frame counter for bounce speed
+outro_count:        dc.w 0      ; Delay counter before accepting input
+coin_anim_frame: dc.w 0         ; Current coin animation frame (0-3)
+coin_anim_ctr:   dc.w 1         ; Frames until next update (1=update now)
+; Coin position cache (for fast animation refresh)
+num_cached_coins: dc.w 0        ; Number of large coins in cache
+coin_cache:      ds.b MAX_COINS*2  ; y,x pairs (1 byte each) - $FF,$FF = collected
+
+; Exit animation
+exit_anim_frame: dc.w 0         ; Current exit color frame (0-3)
+exit_anim_ctr:   dc.w 1         ; Frames until next update
+num_cached_exits: dc.w 0        ; Number of exit tiles in cache
+exit_cache:      ds.b MAX_EXITS*2  ; y,x pairs (1 byte each)
+hero_x:          dc.w 5
+hero_y:          dc.w 60
+hero_dir:        dc.w DIR_STOP
+hero_hit_spike:  dc.w 0               ; Set by is_solid_for_hero when deadly spike hit
+hero_last_dir:   dc.w DIR_DOWN
+hero_fly:        dc.w 0
+hero_land_dir:   dc.w 0               ; Direction hero was moving when stopped (for crack check)
+hero_bounce_dir: dc.w 0               ; Direction to bounce (set by is_solid_for_hero)
+anim_frame:      dc.w 0
+anim_counter:    dc.w 4
+quit_flag:       dc.w 0
+reset_level_flag: dc.w 0              ; R key level reset flag
+active_trails:   dc.w 0
+lives:           dc.w 5             ; Player lives (start with 5)
+prev_lives:      dc.w -1            ; Previous lives value for caching (-1 = force redraw)
+death_anim_count: dc.w 0            ; Death animation frame counter
+death_screen_ptr: dc.l 0            ; Screen address for death sprite
+
+; Cached tick counter pointer (set by qsound_init from sys vars + $2E)
+tick_counter_ptr: dc.l $2802E       ; Pointer to QDOS tick counter
+
+; Frame drop detection
+prev_tick:       dc.w 0             ; Previous frame's tick counter value
+
+; Frame pacer mode (0=adaptive, 1=forced 25fps)
+frame_pacer_mode: dc.w 0
+
+; Frame overrun flag (for pacer sampling without red pixel)
+frame_overrun:   dc.w 0
+
+; QSound SFX function pointers (set by sfx_setup_ptrs at startup)
+sfx_update_ptr:    dc.l 0           ; Absolute address of sfx_update
+qsound_init_ptr:   dc.l 0           ; Absolute address of qsound_init
+ay_silence_ptr:    dc.l 0           ; Absolute address of ay_silence
+sound_to_play_ptr: dc.l 0           ; Absolute address of sound_to_play
+music_start_ptr:   dc.l 0           ; Absolute address of music_start
+otz_decode_ptr:    dc.l 0           ; Absolute address of otz_decode
+audio_tick_ptr:    dc.l 0           ; Absolute address of audio_tick
+
+; Multi-hero system variables
+num_heroes:      dc.w 1             ; Number of heroes in current level
+level_has_hero2: dc.w 0             ; Flag: 1 if level has 2+ heroes (optimization)
+active_hero:     dc.w 0             ; Index of currently controlled hero (0 or 1)
+hero_slots:                         ; Hero slot array (18 bytes per hero)
+        ds.b    MAX_HEROES*HERO_SLOT_SIZE
+hero2_buf_addr:  dc.l 0             ; Buffer address where hero 2 was drawn
+hero2_buf_save:  ds.b 32            ; Saved background for hero 2
+
+; Camera variables (pixel-based smooth scrolling)
+cam_focus_y:     dc.w 0             ; Camera focus position in pixels
+window_y:        dc.w 0             ; Visible window offset in pixels
+hero_last_y:     dc.w 0             ; Hero Y from previous frame (swept enemy/bullet collision)
+col_pattern_ptr:        dc.l 0     ; Pointer to current world's left column pattern
+col_pattern_mirror_ptr: dc.l 0     ; Pointer to current world's right column pattern
+
+hero_drawn_x:    dc.w -1
+hero_drawn_y:    dc.w 0
+hero_drawn_anim: dc.w 0
+hero_drawn_fly:  dc.w 0
+hero_drawn_scroll: dc.w 0
+
+; Compositing variables for flicker-free hero
+hero_buf_addr:   dc.l 0             ; Buffer address where hero was drawn
+hero_buf_save:   ds.b 32            ; Saved background (8 longwords)
+
+; Enemy variables
+num_enemies:     dc.w 0             ; Active enemy count
+; Enemy slot structure (12 bytes each):
+;   +0: active (word) - 0=inactive
+;   +2: x (word) - tile X coordinate
+;   +4: y (word) - tile Y coordinate
+;   +6: dir (word) - ENEMY_LEFT or ENEMY_RIGHT
+;   +8: frame (word) - animation frame 0-3
+;   +10: delay (word) - per-enemy animation delay counter
+enemy_slots:
+        ds.b    MAX_ENEMIES*ENEMY_SLOT_SIZE
+
+; (No enemy save area: bats are persistent, see PERSISTENT BATS)
+
+; Enemy starting positions (for restart after death)
+; Structure: x (word), y (word), dir (word) = 6 bytes each
+enemy_start_data:
+        ds.b    MAX_ENEMIES*6
+num_enemies_start: dc.w 0           ; Enemy count at level start
+
+; Cannon variables
+cannon_count:    dc.w 0              ; Number of cannons on level
+cannon_list:
+        ds.b    MAX_CANNONS*CANNON_SIZE  ; 8 * 10 = 80 bytes
+
+; Bullet variables
+bullet_count:    dc.w 0              ; Number of active bullets
+bullet_list:
+        ds.b    MAX_BULLETS*BULLET_SIZE  ; 2 * 8 = 16 bytes
+
+; Bullet compositing data (for buffer save/restore)
+
+trail_slots:
+        ds.b    NUM_TRAIL_SLOTS*TRAIL_SLOT_SIZE
+
+; (No trail save data: trails are persistent, see composite_trails_to_buffer)
+
+; ============================================================
+; Pre-expanded coin animation frames (MODE 8 format)
+; 4 frames × 32 bytes each = 128 bytes
+; Each frame: 8 rows × 4 bytes (2 words per row, ANDed with COL4_YELLOW)
+; ============================================================
+coin_exp_frames:
+; Frame 0 - Full coin (from B10: $00,$18,$24,$2C,$2C,$24,$18,$00)
+        dc.l    $00000000       ; Row 0: $00
+        dc.l    $02028080       ; Row 1: $18
+        dc.l    $08082020       ; Row 2: $24
+        dc.l    $0808A0A0       ; Row 3: $2C
+        dc.l    $0808A0A0       ; Row 4: $2C
+        dc.l    $08082020       ; Row 5: $24
+        dc.l    $02028080       ; Row 6: $18
+        dc.l    $00000000       ; Row 7: $00
+; Frame 1 - Thin/edge-on (from B10: $00,$18,$18,$18,$18,$18,$18,$00)
+        dc.l    $00000000       ; Row 0: $00
+        dc.l    $02028080       ; Row 1: $18
+        dc.l    $02028080       ; Row 2: $18
+        dc.l    $02028080       ; Row 3: $18
+        dc.l    $02028080       ; Row 4: $18
+        dc.l    $02028080       ; Row 5: $18
+        dc.l    $02028080       ; Row 6: $18
+        dc.l    $00000000       ; Row 7: $00
+; Frame 2 - Full coin alt (from B10: $00,$18,$24,$34,$34,$24,$18,$00)
+        dc.l    $00000000       ; Row 0: $00
+        dc.l    $02028080       ; Row 1: $18
+        dc.l    $08082020       ; Row 2: $24
+        dc.l    $0A0A2020       ; Row 3: $34 (nibble 3=$0A0A, nibble 4=$2020)
+        dc.l    $0A0A2020       ; Row 4: $34
+        dc.l    $08082020       ; Row 5: $24
+        dc.l    $02028080       ; Row 6: $18
+        dc.l    $00000000       ; Row 7: $00
+; Frame 3 - Larger coin (from B10: $00,$3C,$42,$5A,$5A,$42,$3C,$00)
+        dc.l    $00000000       ; Row 0: $00
+        dc.l    $0A0AA0A0       ; Row 1: $3C (nibble 3=$0A0A, nibble C=$A0A0)
+        dc.l    $20200808       ; Row 2: $42
+        dc.l    $22228888       ; Row 3: $5A
+        dc.l    $22228888       ; Row 4: $5A
+        dc.l    $20200808       ; Row 5: $42
+        dc.l    $0A0AA0A0       ; Row 6: $3C
+        dc.l    $00000000       ; Row 7: $00
+
+; Exit animation frames (color cycling when exits active)
+; Exit tile shape: $FF,$81,$81,$81,$81,$81,$81,$FF (hollow square)
+; Each frame: 8 rows × 4 bytes, pre-expanded with different colors
+; ============================================================
+exit_exp_frames:
+; Frame 0 - WHITE ($AAFF)
+        dc.l    $AAFFAAFF       ; Row 0: $FF
+        dc.l    $80C00203       ; Row 1: $81
+        dc.l    $80C00203       ; Row 2: $81
+        dc.l    $80C00203       ; Row 3: $81
+        dc.l    $80C00203       ; Row 4: $81
+        dc.l    $80C00203       ; Row 5: $81
+        dc.l    $80C00203       ; Row 6: $81
+        dc.l    $AAFFAAFF       ; Row 7: $FF
+; Frame 1 - YELLOW ($AAAA)
+        dc.l    $AAAAAAAA       ; Row 0: $FF
+        dc.l    $80800202       ; Row 1: $81
+        dc.l    $80800202       ; Row 2: $81
+        dc.l    $80800202       ; Row 3: $81
+        dc.l    $80800202       ; Row 4: $81
+        dc.l    $80800202       ; Row 5: $81
+        dc.l    $80800202       ; Row 6: $81
+        dc.l    $AAAAAAAA       ; Row 7: $FF
+; Frame 2 - GREEN ($AA00)
+        dc.l    $AA00AA00       ; Row 0: $FF
+        dc.l    $80000200       ; Row 1: $81
+        dc.l    $80000200       ; Row 2: $81
+        dc.l    $80000200       ; Row 3: $81
+        dc.l    $80000200       ; Row 4: $81
+        dc.l    $80000200       ; Row 5: $81
+        dc.l    $80000200       ; Row 6: $81
+        dc.l    $AA00AA00       ; Row 7: $FF
+; Frame 3 - CYAN ($AA55)
+        dc.l    $AA55AA55       ; Row 0: $FF
+        dc.l    $80400201       ; Row 1: $81
+        dc.l    $80400201       ; Row 2: $81
+        dc.l    $80400201       ; Row 3: $81
+        dc.l    $80400201       ; Row 4: $81
+        dc.l    $80400201       ; Row 5: $81
+        dc.l    $80400201       ; Row 6: $81
+        dc.l    $AA55AA55       ; Row 7: $FF
+
+expanded_tiles:
+        ds.b    NUM_TILES*32
+
+; Working buffer for current level (runtime modifications)
+level_working:
+        ds.b    LEVEL_SIZE
+
+; Off-screen playfield buffer (24KB)
+; Full level pre-rendered: 12 tiles × 64 tiles × 8 pixels
+; 48 bytes per scanline × 512 scanlines = 24576 bytes
+playfield_buf:
+; INIT-ONLY DATA lives in the buffer's space: tiles_4bpp (expand_tiles),
+; the side image and mirror_lut (draw_side_images) are read once at start,
+; before anything is rendered into the buffer.  Saves 5.2 KB.
+init_only_start:
+; ============================================================
 ; PRE-EXPANDED 4BPP TILES (QL MODE 8 format)
 ; Each tile is 32 bytes (8 rows x 4 bytes)
 ; Generated from tiles_1bpp + tile_colors
@@ -7396,315 +7560,49 @@ tiles_4bpp:
         dc.l    $00000000,$00000000,$00000000,$00000000
         dc.l    $00000000,$00000000,$00000000,$00000000
 
-; ============================================================
-; WORLD-SPECIFIC BLOCK TILES (pre-expanded 4bpp)
-; These are copied to expanded_tiles at tiles 29-30 based on level
-; ============================================================
-
-; blocks1_tiles - Levels 1-10: Brick wall with offset rows
-; 1bpp Tile 29: $00,$F7,$F7,$F7,$00,$BF,$BF,$00
-; 1bpp Tile 30: $00,$F7,$F7,$F7,$00,$BF,$BF,$BF
-blocks1_tiles:
-        ; Tile 29 - blocks1
-        dc.l    $00000000,$00AA002A,$00AA80AA,$00AA002A
-        dc.l    $00000000,$009A00AA,$008A00AA,$00550055
-        ; Tile 30 - blocks1
-        dc.l    $00000000,$00AA002A
-        dc.l    $00AA80AA,$00AA002A
-        dc.l    $00000000,$008A00AA
-        dc.l    $20AA00AA,$008A00AA
-
-; blocks2_tiles - Levels 16+: Diagonal pattern
-; 1bpp Tile 29: $00,$7E,$7C,$7A,$00,$3C,$38,$34
-; 1bpp Tile 30: $00,$70,$F7,$77,$F7,$67,$D6,$05
-blocks2_tiles:
-        ; Tile 29 - blocks2
-        dc.l    $00000000,$003F00FC
-        dc.l    $003F00F0,$003F00CC
-        dc.l    $00550055,$000F00F0
-        dc.l    $000A0080,$000A0020
-        ; Tile 30 - blocks2
-        dc.l    $00000000,$002A0000
-        dc.l    $00AA002A,$003F003F
-        dc.l    $00FF003F,$003C003F
-        dc.l    $00F7007D,$00000033
-; blocks3_tiles - Levels 11-15: Different brick pattern
-; 1bpp Tile 29: $0E,$EA,$E0,$EE,$EA,$0E,$E0,$00
-; 1bpp Tile 30: $FA,$EC,$7E,$BA,$7C,$BE,$56,$00
-blocks3_tiles:
-        ; Tile 29 - blocks3
-        dc.l    $0000A8FC,$A8548844
-        dc.l    $A8FC0000,$A855A855
-        dc.l    $A8558855,$0000A854
-        dc.l    $A8FC0000,$00000000
-        ; Tile 30 - blocks3
-        dc.l    $AAFF88DD,$A8FDA0F5
-        dc.l    $2A7FA8FD,$8ADF88DD
-        dc.l    $2A7FA0F5,$8ADFA8FD
-        dc.l    $22FF28FF,$00000000
-
-; ============================================================
-; ALL LEVEL DATA
-; Levels stored contiguously so we can calculate addresses:
-;   level_addr = level00 + (level_index * LEVEL_SIZE)
-; ============================================================
-        include "levels_compressed.inc"
-
+; Side image data (generated from pl1.png, 60x133, QL MODE 8)
+; Right side is mirrored from left at runtime (see draw_side_images)
+bg1_left:
+        incbin  "pl1_left.bin"
         even
 
-; ============================================================
-; VARIABLES
-; ============================================================
-level_data_ptr:  dc.l 0         ; Stored base address for writes
-current_level:   dc.w 0         ; Current level index (0-20)
-coin_count:      dc.w 0         ; Collected coins this level
-coins_total:     dc.w 0         ; Total coins in level (for exit activation)
-level_complete_flag: dc.w 0    ; Set by process_tile_effects when on active exit
-heroes_exited:   dc.w 0         ; Bitmask: bit 0 = hero 0 exited, bit 1 = hero 1 exited
+; mirror_lut - 256-byte lookup table for reversing 4 pixels in a byte
+; Each byte has 4 x 2-bit fields: ABCDEFGH -> GHEFCDAB
+; entry[i] = ((i&$03)<<6) | ((i&$0C)<<2) | ((i&$30)>>2) | ((i&$C0)>>6)
+mirror_lut:
+        dc.b    $00,$40,$80,$C0,$10,$50,$90,$D0,$20,$60,$A0,$E0,$30,$70,$B0,$F0
+        dc.b    $04,$44,$84,$C4,$14,$54,$94,$D4,$24,$64,$A4,$E4,$34,$74,$B4,$F4
+        dc.b    $08,$48,$88,$C8,$18,$58,$98,$D8,$28,$68,$A8,$E8,$38,$78,$B8,$F8
+        dc.b    $0C,$4C,$8C,$CC,$1C,$5C,$9C,$DC,$2C,$6C,$AC,$EC,$3C,$7C,$BC,$FC
+        dc.b    $01,$41,$81,$C1,$11,$51,$91,$D1,$21,$61,$A1,$E1,$31,$71,$B1,$F1
+        dc.b    $05,$45,$85,$C5,$15,$55,$95,$D5,$25,$65,$A5,$E5,$35,$75,$B5,$F5
+        dc.b    $09,$49,$89,$C9,$19,$59,$99,$D9,$29,$69,$A9,$E9,$39,$79,$B9,$F9
+        dc.b    $0D,$4D,$8D,$CD,$1D,$5D,$9D,$DD,$2D,$6D,$AD,$ED,$3D,$7D,$BD,$FD
+        dc.b    $02,$42,$82,$C2,$12,$52,$92,$D2,$22,$62,$A2,$E2,$32,$72,$B2,$F2
+        dc.b    $06,$46,$86,$C6,$16,$56,$96,$D6,$26,$66,$A6,$E6,$36,$76,$B6,$F6
+        dc.b    $0A,$4A,$8A,$CA,$1A,$5A,$9A,$DA,$2A,$6A,$AA,$EA,$3A,$7A,$BA,$FA
+        dc.b    $0E,$4E,$8E,$CE,$1E,$5E,$9E,$DE,$2E,$6E,$AE,$EE,$3E,$7E,$BE,$FE
+        dc.b    $03,$43,$83,$C3,$13,$53,$93,$D3,$23,$63,$A3,$E3,$33,$73,$B3,$F3
+        dc.b    $07,$47,$87,$C7,$17,$57,$97,$D7,$27,$67,$A7,$E7,$37,$77,$B7,$F7
+        dc.b    $0B,$4B,$8B,$CB,$1B,$5B,$9B,$DB,$2B,$6B,$AB,$EB,$3B,$7B,$BB,$FB
+        dc.b    $0F,$4F,$8F,$CF,$1F,$5F,$9F,$DF,$2F,$6F,$AF,$EF,$3F,$7F,$BF,$FF
+        even
 
-; Hero exit animation
-hero_exit_active: dc.w 0        ; Flag: exit animation is playing
-hero_exit_frame:  dc.w 0        ; Current animation frame (0-6)
-hero_exit_delay:  dc.w 0        ; Delay counter between frames
-hero_exit_x:      dc.w 0        ; X position of exiting hero (grid)
-hero_exit_y:      dc.w 0        ; Y position of exiting hero (grid)
-hero_exit_hero_id: dc.w 0       ; Which hero is exiting (0 or 1)
-HERO_EXIT_ANIM_SPEED equ 4      ; Frames between animation updates
+init_only_end:
+        if (init_only_end-playfield_buf)>BUF_SIZE
+        fail    "init-only data larger than playfield_buf"
+        endif
+        ds.b    BUF_SIZE-(init_only_end-playfield_buf)
 
-game_state:      dc.w GS_GAMEPLAY  ; Current game state
-win_flash_ctr:   dc.w 0         ; Counter for "PRESS SPACE" flash
-; Title screen variables
-title_flash_ctr:   dc.w 0       ; Counter for "PUSH FIRE" flash
-title_text_visible: dc.w 1      ; 1 = text visible, 0 = hidden
-; Outro bounce animation variables
-outro_bounce_idx:   dc.w 0      ; Current index into bounce table (0-7)
-outro_bounce_frame: dc.w 0      ; Frame counter for bounce speed
-outro_count:        dc.w 0      ; Delay counter before accepting input
-coin_anim_frame: dc.w 0         ; Current coin animation frame (0-3)
-coin_anim_ctr:   dc.w 1         ; Frames until next update (1=update now)
-; Coin position cache (for fast animation refresh)
-num_cached_coins: dc.w 0        ; Number of large coins in cache
-coin_cache:      ds.b MAX_COINS*2  ; x,y pairs (1 byte each) - $FF,$FF = collected
-
-; Exit animation
-exit_anim_frame: dc.w 0         ; Current exit color frame (0-3)
-exit_anim_ctr:   dc.w 1         ; Frames until next update
-num_cached_exits: dc.w 0        ; Number of exit tiles in cache
-exit_cache:      ds.b MAX_EXITS*2  ; y,x pairs (1 byte each)
-hero_x:          dc.w 5
-hero_y:          dc.w 60
-hero_dir:        dc.w DIR_STOP
-hero_hit_spike:  dc.w 0               ; Set by is_solid_for_hero when deadly spike hit
-hero_last_dir:   dc.w DIR_DOWN
-hero_fly:        dc.w 0
-hero_land_dir:   dc.w 0               ; Direction hero was moving when stopped (for crack check)
-hero_bounce_dir: dc.w 0               ; Direction to bounce (set by is_solid_for_hero)
-anim_frame:      dc.w 0
-anim_counter:    dc.w 4
-quit_flag:       dc.w 0
-reset_level_flag: dc.w 0              ; R key level reset flag
-active_trails:   dc.w 0
-lives:           dc.w 5             ; Player lives (start with 5)
-prev_lives:      dc.w -1            ; Previous lives value for caching (-1 = force redraw)
-death_anim_count: dc.w 0            ; Death animation frame counter
-death_screen_ptr: dc.l 0            ; Screen address for death sprite
-
-; Cached tick counter pointer (set by qsound_init from sys vars + $2E)
-tick_counter_ptr: dc.l $2802E       ; Pointer to QDOS tick counter
-
-; Frame drop detection
-prev_tick:       dc.w 0             ; Previous frame's tick counter value
-
-; Frame pacer mode (0=adaptive, 1=forced 25fps)
-frame_pacer_mode: dc.w 0
-
-; Frame overrun flag (for pacer sampling without red pixel)
-frame_overrun:   dc.w 0
-
-; QSound SFX function pointers (set by sfx_setup_ptrs at startup)
-sfx_update_ptr:    dc.l 0           ; Absolute address of sfx_update
-qsound_init_ptr:   dc.l 0           ; Absolute address of qsound_init
-ay_silence_ptr:    dc.l 0           ; Absolute address of ay_silence
-sound_to_play_ptr: dc.l 0           ; Absolute address of sound_to_play
-
-; Multi-hero system variables
-num_heroes:      dc.w 1             ; Number of heroes in current level
-level_has_hero2: dc.w 0             ; Flag: 1 if level has 2+ heroes (optimization)
-active_hero:     dc.w 0             ; Index of currently controlled hero (0 or 1)
-hero_slots:                         ; Hero slot array (18 bytes per hero)
-        ds.b    MAX_HEROES*HERO_SLOT_SIZE
-hero2_buf_addr:  dc.l 0             ; Buffer address where hero 2 was drawn
-hero2_buf_save:  ds.b 32            ; Saved background for hero 2
-
-; Camera variables (pixel-based smooth scrolling)
-cam_focus_y:     dc.w 0             ; Camera focus position in pixels
-window_y:        dc.w 0             ; Visible window offset in pixels
-hero_last_y:     dc.w 0             ; Hero Y from previous frame (for camera lag)
-col_pattern_ptr:        dc.l 0     ; Pointer to current world's left column pattern
-col_pattern_mirror_ptr: dc.l 0     ; Pointer to current world's right column pattern
-
-hero_drawn_x:    dc.w -1
-hero_drawn_y:    dc.w 0
-hero_drawn_anim: dc.w 0
-hero_drawn_fly:  dc.w 0
-hero_drawn_scroll: dc.w 0
-
-; Compositing variables for flicker-free hero
-hero_buf_addr:   dc.l 0             ; Buffer address where hero was drawn
-hero_buf_save:   ds.b 32            ; Saved background (8 longwords)
-
-; Enemy variables
-num_enemies:     dc.w 0             ; Active enemy count
-; Enemy slot structure (12 bytes each):
-;   +0: active (word) - 0=inactive
-;   +2: x (word) - tile X coordinate
-;   +4: y (word) - tile Y coordinate
-;   +6: dir (word) - ENEMY_LEFT or ENEMY_RIGHT
-;   +8: frame (word) - animation frame 0-3
-;   +10: delay (word) - per-enemy animation delay counter
-enemy_slots:
-        ds.b    MAX_ENEMIES*ENEMY_SLOT_SIZE
-
-; Compositing data for enemies (64 bytes save area per enemy)
-enemy_buf_addrs: ds.l MAX_ENEMIES   ; Buffer addresses where enemies drawn
-enemy_buf_saves: ds.b MAX_ENEMIES*64 ; Saved backgrounds (8 bytes x 8 rows each)
-
-; Enemy starting positions (for restart after death)
-; Structure: x (word), y (word), dir (word) = 6 bytes each
-enemy_start_data:
-        ds.b    MAX_ENEMIES*6
-num_enemies_start: dc.w 0           ; Enemy count at level start
-
-; Cannon variables
-cannon_count:    dc.w 0              ; Number of cannons on level
-cannon_list:
-        ds.b    MAX_CANNONS*CANNON_SIZE  ; 8 * 10 = 80 bytes
-
-; Bullet variables
-bullet_count:    dc.w 0              ; Number of active bullets
-bullet_list:
-        ds.b    MAX_BULLETS*BULLET_SIZE  ; 2 * 8 = 16 bytes
-
-; Bullet compositing data (for buffer save/restore)
-bullet_buf_addrs: ds.l MAX_BULLETS   ; Buffer addresses where bullets drawn
-bullet_buf_saves: ds.b MAX_BULLETS*8 ; Saved backgrounds (2 rows × 4 bytes each)
-
-trail_slots:
-        ds.b    NUM_TRAIL_SLOTS*TRAIL_SLOT_SIZE
-
-; Trail compositing save data (for buffer save/restore)
-trail_buf_addrs: ds.l NUM_TRAIL_SLOTS   ; Buffer addresses where trails drawn
-trail_buf_saves: ds.b NUM_TRAIL_SLOTS*32 ; Saved backgrounds (8 longwords each)
-
-; ============================================================
-; Pre-expanded coin animation frames (MODE 8 format)
-; 4 frames × 32 bytes each = 128 bytes
-; Each frame: 8 rows × 4 bytes (2 words per row, ANDed with COL4_YELLOW)
-; ============================================================
-coin_exp_frames:
-; Frame 0 - Full coin (from B10: $00,$18,$24,$2C,$2C,$24,$18,$00)
-        dc.l    $00000000       ; Row 0: $00
-        dc.l    $02028080       ; Row 1: $18
-        dc.l    $08082020       ; Row 2: $24
-        dc.l    $0808A0A0       ; Row 3: $2C
-        dc.l    $0808A0A0       ; Row 4: $2C
-        dc.l    $08082020       ; Row 5: $24
-        dc.l    $02028080       ; Row 6: $18
-        dc.l    $00000000       ; Row 7: $00
-; Frame 1 - Thin/edge-on (from B10: $00,$18,$18,$18,$18,$18,$18,$00)
-        dc.l    $00000000       ; Row 0: $00
-        dc.l    $02028080       ; Row 1: $18
-        dc.l    $02028080       ; Row 2: $18
-        dc.l    $02028080       ; Row 3: $18
-        dc.l    $02028080       ; Row 4: $18
-        dc.l    $02028080       ; Row 5: $18
-        dc.l    $02028080       ; Row 6: $18
-        dc.l    $00000000       ; Row 7: $00
-; Frame 2 - Full coin alt (from B10: $00,$18,$24,$34,$34,$24,$18,$00)
-        dc.l    $00000000       ; Row 0: $00
-        dc.l    $02028080       ; Row 1: $18
-        dc.l    $08082020       ; Row 2: $24
-        dc.l    $0A0A2020       ; Row 3: $34 (nibble 3=$0A0A, nibble 4=$2020)
-        dc.l    $0A0A2020       ; Row 4: $34
-        dc.l    $08082020       ; Row 5: $24
-        dc.l    $02028080       ; Row 6: $18
-        dc.l    $00000000       ; Row 7: $00
-; Frame 3 - Larger coin (from B10: $00,$3C,$42,$5A,$5A,$42,$3C,$00)
-        dc.l    $00000000       ; Row 0: $00
-        dc.l    $0A0AA0A0       ; Row 1: $3C (nibble 3=$0A0A, nibble C=$A0A0)
-        dc.l    $20200808       ; Row 2: $42
-        dc.l    $22228888       ; Row 3: $5A
-        dc.l    $22228888       ; Row 4: $5A
-        dc.l    $20200808       ; Row 5: $42
-        dc.l    $0A0AA0A0       ; Row 6: $3C
-        dc.l    $00000000       ; Row 7: $00
-
-; Exit animation frames (color cycling when exits active)
-; Exit tile shape: $FF,$81,$81,$81,$81,$81,$81,$FF (hollow square)
-; Each frame: 8 rows × 4 bytes, pre-expanded with different colors
-; ============================================================
-exit_exp_frames:
-; Frame 0 - WHITE ($AAFF)
-        dc.l    $AAFFAAFF       ; Row 0: $FF
-        dc.l    $80C00203       ; Row 1: $81
-        dc.l    $80C00203       ; Row 2: $81
-        dc.l    $80C00203       ; Row 3: $81
-        dc.l    $80C00203       ; Row 4: $81
-        dc.l    $80C00203       ; Row 5: $81
-        dc.l    $80C00203       ; Row 6: $81
-        dc.l    $AAFFAAFF       ; Row 7: $FF
-; Frame 1 - YELLOW ($AAAA)
-        dc.l    $AAAAAAAA       ; Row 0: $FF
-        dc.l    $80800202       ; Row 1: $81
-        dc.l    $80800202       ; Row 2: $81
-        dc.l    $80800202       ; Row 3: $81
-        dc.l    $80800202       ; Row 4: $81
-        dc.l    $80800202       ; Row 5: $81
-        dc.l    $80800202       ; Row 6: $81
-        dc.l    $AAAAAAAA       ; Row 7: $FF
-; Frame 2 - GREEN ($AA00)
-        dc.l    $AA00AA00       ; Row 0: $FF
-        dc.l    $80000200       ; Row 1: $81
-        dc.l    $80000200       ; Row 2: $81
-        dc.l    $80000200       ; Row 3: $81
-        dc.l    $80000200       ; Row 4: $81
-        dc.l    $80000200       ; Row 5: $81
-        dc.l    $80000200       ; Row 6: $81
-        dc.l    $AA00AA00       ; Row 7: $FF
-; Frame 3 - CYAN ($AA55)
-        dc.l    $AA55AA55       ; Row 0: $FF
-        dc.l    $80400201       ; Row 1: $81
-        dc.l    $80400201       ; Row 2: $81
-        dc.l    $80400201       ; Row 3: $81
-        dc.l    $80400201       ; Row 4: $81
-        dc.l    $80400201       ; Row 5: $81
-        dc.l    $80400201       ; Row 6: $81
-        dc.l    $AA55AA55       ; Row 7: $FF
-
-expanded_tiles:
-        ds.b    NUM_TILES*32
-
-; Working buffer for current level (runtime modifications)
-level_working:
-        ds.b    LEVEL_SIZE
-
-; Off-screen playfield buffer (24KB)
-; Full level pre-rendered: 12 tiles × 64 tiles × 8 pixels
-; 48 bytes per scanline × 512 scanlines = 24576 bytes
-playfield_buf:
-        ds.b    BUF_SIZE
-
-; bg1_left and mirror_lut moved to end of binary for memory overlay
-; See "Reclaimable Memory" section at end of file
 
 ; ============================================================
 ; QSound SFX Engine (AY-3-8910 via QSound ROM vector)
 ; ============================================================
 ; Ported from Spectrum 128K AFX engine (Z80) to 68008 assembly.
-; Plays sound effects through QSound ROM/QPC2 emulation using
-; the AY.JMP dispatch vector at SV_BASE+$164.
+; Detects QSound via the AY.JMP vector at SV_BASE+$164 (AY.INIT and
+; AY.WRALL at init only); playback writes the AY ports $C2000/$C2002 directly.
 ; Placed at end of binary; called via function pointers to
-; avoid PC-relative displacement issues in the 65KB binary.
+; avoid PC-relative displacement issues in the ~83 KB binary.
 ; ============================================================
 
 ; --- SFX engine data (near code for PC-relative) ---
@@ -7724,9 +7622,39 @@ afx_bank_ptr:      dc.l 0
 ; Cached AY.JMP dispatch vector (set during qsound_init)
 ay_jmp_vector:     dc.l 0
 
+; --- Music player data ---
+music_regs:        dc.b 0,0,0,0,0,0,0,$3F,0,0,0,0,0,0   ; Music-only AY register output
+                   even
+music_playing:     dc.w 0          ; 1 = music active, 0 = silent
+current_music_id:  dc.w 255        ; Currently loaded track ID
+
+; reg13_dirty: set by psg_frame when TBK updates register 13.
+; ay_write_all only writes reg13 to hardware when this is non-zero.
+reg13_dirty:       dc.w 0          ; Non-zero = TBK updated reg 13 this frame
+prev_audio_tick:   dc.w 0          ; QDOS build: tick of the last audio step
+audio_sfx_seen:    dc.b 0          ; an SFX started (profiler reads + clears)
+                   even
+
+; TBK decompression state
+tbk_buffer:        ds.b 16         ; Unpacked register frame (16 bytes)
+tbk_stream:        dc.l 0          ; Current position in packed data stream
+tbk_prev:          dc.l 0          ; Saved return position (for replay commands)
+tbk_loop_addr:     dc.l 0          ; Start of packed data (for track looping)
+tbk_pausing:       dc.w 0          ; Pause frames remaining (0=not pausing)
+
+; Replay stack for nested TBK replay commands (4 levels x 8 bytes)
+REPLAY_STACK_MAX equ 4
+replay_stack:       ds.b REPLAY_STACK_MAX*8
+replay_stack_depth: dc.w 0
+                    even
+
 ; --- Sound bank data (25Hz decimated, 302 bytes, 9 effects) ---
 sound_bank:
+        ifd MUSIC50
+        incbin  "tomba_50hz.afb"        ; TEST: original 50 Hz effects
+        else
         incbin  "tomba_25hz.afb"
+        endif
         even
 
 ; ============================================================
@@ -7751,6 +7679,8 @@ qsound_init:
         ; Prevents wait_vsync from seeing a huge elapsed count on first call.
         move.w  (a2),d0
         lea     prev_tick(pc),a1
+        move.w  d0,(a1)
+        lea     prev_audio_tick(pc),a1
         move.w  d0,(a1)
 
         ; Check if QSound vector is installed at SV.AYJMP ($164)
@@ -7870,27 +7800,38 @@ sfx_play:
         rts
 
 ; ============================================================
-; sfx_update - Per-frame sound update (SFX only, no music)
-; 128KB edition - FX only via QSound or IPC beeper
-; Based on T94n proven audio implementation
+; sfx_update - once per game frame.
+;  Beeper: send a queued effect (MT.IPCOM).
+;  QSound: the 25 Hz audio step (audio_tick) runs on the 50 Hz clock, not
+;  per game frame: POLLED - poll_tick calls it on every 2nd tick; QDOS
+;  build - here, one step per 2 QDOS ticks since the last one (resync after
+;  a long gap such as a level load, instead of a burst).
 ; ============================================================
 sfx_update:
         move.w  qsound_mode(pc),d0
         beq.s   .done                   ; QSND_NONE
         cmpi.w  #QSND_BEEPER,d0
         beq.s   .beeper_path
-
-        ; --- QSound path (QSND_VECTOR) - T94n exact ---
-        ; Check for queued effect
-        lea     sound_to_play(pc),a0
+        ifnd POLLED
+        movem.l d0-d1/a0,-(sp)
+        movea.l tick_counter_ptr(pc),a0
         move.w  (a0),d0
-        cmpi.w  #SFX_NONE,d0
-        beq.s   .no_new
-        bsr     sfx_play                ; Trigger queued effect
-        move.w  #SFX_NONE,(a0)          ; Clear queue
-.no_new:
-        bsr     sfx_frame               ; Update active channels
-        bsr     ay_write_all            ; Send to hardware
+        sub.w   prev_audio_tick(pc),d0
+        cmpi.w  #8,d0
+        bls.s   .catch
+        move.w  (a0),d0                 ; long gap: resync, one step
+        lea     prev_audio_tick(pc),a0
+        move.w  d0,(a0)
+        bsr     audio_tick
+        bra.s   .q_out
+.catch: lea     prev_audio_tick(pc),a0
+.step:  subq.w  #2,d0
+        bmi.s   .q_out
+        addq.w  #2,(a0)
+        bsr     audio_tick
+        bra.s   .step
+.q_out: movem.l (sp)+,d0-d1/a0
+        endif
         rts
 
         ; --- IPC beeper path ---
@@ -7900,74 +7841,136 @@ sfx_update:
         cmpi.w  #SFX_NONE,d0
         beq.s   .done
         move.w  #SFX_NONE,(a0)          ; Clear before call
+        lea     audio_sfx_seen(pc),a0   ; for the profiler's SFX flag
+        st      (a0)
         bsr     beeper_play_sfx
 .done:  rts
 
 ; ============================================================
-; sfx_frame - Process all 3 AFX channels, write to ay_regs
-; Direct SFX playback (no amplitude mixing)
+; audio_tick - one 25 Hz audio step (QSound only): queued SFX, one TBK
+; frame of music, mix, write the AY.  Called from the clock (see above).
+; All registers preserved.
 ; ============================================================
-sfx_frame:
-        movem.l d0-d5/a0-a3,-(sp)
-
-        ; Start with mixer = all off ($3F = all tone+noise disabled)
-        moveq   #$3F,d4
-        lea     ay_regs(pc),a3
-
-        ; Clear amplitudes
-        clr.b   8(a3)
-        clr.b   9(a3)
-        clr.b   10(a3)
-
-        ; --- Process Channel A ---
-        lea     afx_ch_data(pc),a0
-        bsr     .process_channel
-        move.b  4(a0),8(a3)            ; AmplA
-        move.b  6(a0),0(a3)            ; TonA_lo
-        move.b  7(a0),1(a3)            ; TonA_hi
-        ; Channel A mixer: info bit4→mixer bit0 (tone), bit7→bit3 (noise)
-        move.b  5(a0),d0
-        lsr.b   #4,d0                  ; bit4→bit0, bit7→bit3
-        andi.b  #$09,d0                ; keep bits 0 and 3 only
-        andi.b  #$F6,d4                ; clear chA bits in mixer
-        or.b    d0,d4                  ; merge (1=disabled, AY active-low)
-
-        ; --- Process Channel B ---
-        lea     afx_ch_data+AFX_CH_SIZE(pc),a0
-        bsr     .process_channel
-        move.b  4(a0),9(a3)            ; AmplB
-        move.b  6(a0),2(a3)            ; TonB_lo
-        move.b  7(a0),3(a3)            ; TonB_hi
-        ; Channel B mixer: info bit4→mixer bit1 (tone), bit7→bit4 (noise)
-        move.b  5(a0),d0
-        lsr.b   #3,d0                  ; bit4→bit1, bit7→bit4
-        andi.b  #$12,d0                ; keep bits 1 and 4 only
-        andi.b  #$ED,d4                ; clear chB bits in mixer
-        or.b    d0,d4                  ; merge
-
-        ; --- Process Channel C ---
-        lea     afx_ch_data+AFX_CH_SIZE*2(pc),a0
-        bsr     .process_channel
-        move.b  4(a0),10(a3)           ; AmplC
-        move.b  6(a0),4(a3)            ; TonC_lo
-        move.b  7(a0),5(a3)            ; TonC_hi
-        ; Channel C mixer: info bit4→mixer bit2 (tone), bit7→bit5 (noise)
-        move.b  5(a0),d0
-        lsr.b   #2,d0                  ; bit4→bit2, bit7→bit5
-        andi.b  #$24,d0                ; keep bits 2 and 5 only
-        andi.b  #$DB,d4                ; clear chC bits in mixer
-        or.b    d0,d4                  ; merge
-
-        ; Store mixer and noise
-        move.b  d4,7(a3)
-        lea     afx_noise_period(pc),a0
-        move.b  (a0),6(a3)
-
-        movem.l (sp)+,d0-d5/a0-a3
+audio_tick:
+        movem.l d0-d2/a0-a1,-(sp)
+        move.w  qsound_mode(pc),d0
+        cmpi.w  #QSND_VECTOR,d0
+        bne.s   .out
+        ; 1. SFX trigger
+        lea     sound_to_play(pc),a0
+        move.w  (a0),d0
+        cmpi.w  #SFX_NONE,d0
+        beq.s   .no_sfx
+        lea     audio_sfx_seen(pc),a1   ; for the profiler's SFX flag
+        st      (a1)
+        bsr     sfx_play
+        lea     sound_to_play(pc),a0
+        move.w  #SFX_NONE,(a0)
+.no_sfx:
+        ; 2. One frame of music
+        move.w  music_playing(pc),d0
+        beq.s   .no_music
+        lea     reg13_dirty(pc),a0
+        clr.w   (a0)
+        bsr     psg_frame
+.no_music:
+        ; 3. music_regs -> ay_regs
+        lea     music_regs(pc),a0
+        lea     ay_regs(pc),a1
+        move.l  (a0)+,(a1)+             ; regs 0-3
+        move.l  (a0)+,(a1)+             ; regs 4-7
+        move.l  (a0)+,(a1)+             ; regs 8-11
+        move.w  (a0)+,(a1)+             ; regs 12-13
+        ; 4. SFX overlay: advance once, overlay once
+        bsr     sfx_tick_advance
+        bsr     sfx_apply_overlay
+        ; 5. Hardware
+        bsr     ay_write_all
+        ifd PROFILE
+        ifnd NOMUSIC
+        ifnd MUSIC_ONE
+        bsr     prof_mus_rec            ; music check log (otmlog)
+        endif
+        endif
+        endif
+.out:   movem.l (sp)+,d0-d2/a0-a1
         rts
 
-; --- Process single channel ---
-.process_channel:
+; ============================================================
+; SFX processing: split into advance + overlay (channel B only).
+;
+; sfx_tick_advance  - Advance SFX data pointer by one frame.
+;                     Updates channel state (amp, tone, noise, mixer bits)
+;                     but does NOT modify ay_regs.
+;
+; sfx_apply_overlay - Apply current SFX channel state onto ay_regs.
+;                     Does NOT advance. Channel-B only. SFX overrides
+;                     music channel B only when SFX amplitude is
+;                     STRICTLY GREATER than music amplitude.
+;                     Full SFX amplitude (no scaling).
+;                     Shared noise protection: when SFX uses noise on B,
+;                     disable noise on channels A and C in the mixer.
+; ============================================================
+
+; --- sfx_tick_advance: advance SFX state by one frame ---
+sfx_tick_advance:
+        movem.l d0-d2/a0-a2,-(sp)
+        lea     afx_ch_data+AFX_CH_SIZE(pc),a0
+        bsr     sfx_process_channel
+        movem.l (sp)+,d0-d2/a0-a2
+        rts
+
+; --- sfx_apply_overlay: overlay current SFX state onto ay_regs ---
+sfx_apply_overlay:
+        movem.l d0-d2/a0-a3,-(sp)
+
+        lea     ay_regs(pc),a3
+        lea     afx_ch_data+AFX_CH_SIZE(pc),a0
+
+        ; Check if SFX channel B is active (amplitude > 0)
+        move.b  4(a0),d0               ; SFX amplitude
+        beq.s   .ov_done               ; SFX inactive or silent
+
+        ; If music uses envelope mode, music always wins
+        move.b  9(a3),d1               ; Music amplitude for ch B
+        btst    #4,d1                  ; Envelope mode?
+        bne.s   .ov_done               ; Yes → music always wins
+
+        ; Amplitude priority: SFX must be STRICTLY louder
+        ; Full SFX amplitude (v1.2 music edition scaled it to 75%)
+        andi.b  #$0F,d0                ; mask SFX to 4 bits
+        beq.s   .ov_done               ; silent → skip
+        andi.b  #$0F,d1                ; mask music to 4 bits
+        cmp.b   d1,d0
+        bls.s   .ov_done               ; SFX <= music → music wins
+
+        ; SFX wins: override channel B in ay_regs
+        move.b  d0,9(a3)               ; AmplB (full SFX amplitude)
+        move.b  6(a0),2(a3)            ; TonB_lo
+        move.b  7(a0),3(a3)            ; TonB_hi
+
+        ; Override mixer bits for channel B only (bits 1 and 4)
+        move.b  7(a3),d1               ; current ay_regs mixer
+        andi.b  #$ED,d1                ; clear ch B bits (1 and 4)
+        move.b  5(a0),d0               ; SFX info byte
+        lsr.b   #3,d0                  ; bit4→bit1, bit7→bit4
+        andi.b  #$12,d0                ; keep bits 1 and 4 only
+        or.b    d0,d1                  ; merge SFX mixer bits
+        move.b  d1,7(a3)               ; write back
+
+        ; If SFX has noise, override noise period AND protect music channels
+        btst    #7,5(a0)               ; noise enable bit in SFX info
+        beq.s   .ov_done
+        lea     afx_noise_period(pc),a2
+        move.b  (a2),6(a3)             ; Override noise period in ay_regs
+        ; Shared noise generator protection
+        ori.b   #$28,7(a3)             ; Disable noise on A (bit3) and C (bit5)
+.ov_done:
+        movem.l (sp)+,d0-d2/a0-a3
+        rts
+
+; --- Process single SFX channel (advance one frame) ---
+sfx_process_channel:
         move.l  (a0),d0
         beq.s   .ch_inactive
 
@@ -8009,12 +8012,14 @@ sfx_frame:
         rts
 
 ; ============================================================
-; ay_write_all - Write AY registers via direct hardware ports
+; ay_write_all - Write AY registers directly to hardware ports.
+;
 ; Bypasses QSound ROM dispatch for lower latency.
 ; Reordered: amplitudes first, tones/noise, envelope, mixer last.
-; Calls scale_periods to convert Spectrum AY clock to QSound clock.
-; ============================================================
-; QSound AY port addresses:
+; Register 13 only written when reg13_dirty is set (avoids
+; restarting the envelope generator unnecessarily).
+;
+; QSound AY-3-8910 hardware interface:
 ;   $000C2000 = data bus (register number or value)
 ;   $000C2002 = control port (bus mode: BDIR/BC1/BC2)
 ;   $0F = LATCH ADDRESS (BC1=1, BDIR=1)
@@ -8064,10 +8069,17 @@ ay_write_all:
         AY_WRITE_REG 5,5
         AY_WRITE_REG 6,6
 
-        ; Phase 3: Envelope (regs 11, 12, 13)
+        ; Phase 3: Envelope (regs 11, 12)
         AY_WRITE_REG 11,11
         AY_WRITE_REG 12,12
+
+        ; Phase 3b: Envelope shape (reg 13) - CONDITIONAL
+        ; On YM2149, writing register 13 RESTARTS the envelope generator.
+        ; Only write when TBK actually changed the value (reg13_dirty set).
+        move.w  reg13_dirty(pc),d2
+        beq.s   .skip_r13
         AY_WRITE_REG 13,13
+.skip_r13:
 
         ; Phase 4: Mixer LAST (reg 7)
         AY_WRITE_REG 7,7
@@ -8084,7 +8096,7 @@ ay_write_all:
 ; Scaling factor: 750,000 / 1,773,400 = 27/64 = 0.421875
 ; (exact ratio is 0.42288, error < 0.25%)
 ;
-; Modifies ay_regs in place. Clobbers d0 only.
+; Modifies ay_regs in place. Clobbers d0 and a0 (ay_write_all saves both).
 ; ============================================================
 scale_periods:
         lea     ay_regs(pc),a0
@@ -8166,7 +8178,7 @@ ay_silence:
         rts
 
 ; ============================================================
-; End of QSound SFX Engine (no music player)
+; End of QSound SFX Engine
 ; ============================================================
 
 ; ============================================================
@@ -8174,7 +8186,7 @@ ay_silence:
 ; Fallback sound output using the QL's native IPC beeper.
 ; Uses MT.IPCOM (trap #1, d0=$11) with pre-built command blocks.
 ; Sys vars pointer cached during init to avoid per-call MT.INF.
-; No per-frame overhead — only sends IPC command on landing trigger.
+; No per-frame overhead — only sends an IPC command when an effect is queued.
 ; ============================================================
 
 ; --- Cached sys vars pointer (set during qsound_init) ---
@@ -8278,7 +8290,7 @@ beep_gold:
 ; ============================================================
 ; beeper_play_sfx - IPC beeper dispatcher
 ; Input: D0.w = effect ID (0-8)
-; Handles all game SFX triggers including GOLD and EXIT.
+; Maps CANNON, FLY, SWAP, DEAD, EXIT and FIN (same warble), plus GOLD; LAND/PUSH get no beep.
 ; ============================================================
 beeper_play_sfx:
         cmpi.w  #SFX_CANNON,d0
@@ -8331,48 +8343,514 @@ beeper_play_cmd:
         move.l  (sp)+,a6
         rts
 
+
 ; ============================================================
-; Reclaimable Memory Section
+; PSG Music Player (TBK decompression)
 ; ============================================================
-; This data is only needed during init (draw_side_images).
-; After sides are drawn to screen memory, this 4246 bytes can
-; be overwritten with extended music/AFX data.
+
+; ============================================================
+; psg_init - Initialize TBK player for a track
+; Input: D0.w = track ID (0-4)
+; Plays the track decoded into music_buf by music_start
+; ============================================================
+psg_init:
+        movem.l d0-d3/a0-a3,-(sp)
+
+        ; Bounds check
+        cmpi.w  #NUM_TRACKS,d0
+        bcc     .bad_track
+
+        move.w  d0,d2                   ; save track ID
+
+        ; The track is already decoded into music_buf (music_start)
+        lea     music_buf(pc),a2
+
+        ; Set stream pointers to the decoded track
+        lea     tbk_stream(pc),a1
+        move.l  a2,(a1)
+        lea     tbk_loop_addr(pc),a1
+        move.l  a2,(a1)
+
+        ; Clear TBK buffer
+        lea     tbk_buffer(pc),a0
+        clr.l   (a0)+                   ; bytes 0-3
+        clr.l   (a0)+                   ; bytes 4-7
+        clr.l   (a0)+                   ; bytes 8-11
+        clr.l   (a0)+                   ; bytes 12-15
+        lea     tbk_buffer+7(pc),a0
+        move.b  #$3F,(a0)               ; mixer = all disabled (matches music_regs)
+        lea     tbk_buffer+13(pc),a0
+        move.b  #$FF,(a0)               ; reg13 flag = no update
+
+        ; Clear saved return pointer and pause
+        lea     tbk_prev(pc),a0
+        clr.l   (a0)
+        lea     tbk_pausing(pc),a0
+        clr.w   (a0)
+
+        ; Clear replay stack
+        lea     replay_stack_depth(pc),a0
+        clr.w   (a0)
+
+        ; Clear music_regs to silence
+        lea     music_regs(pc),a0
+        moveq   #13,d0
+.clr_regs:
+        clr.b   (a0)+
+        dbra    d0,.clr_regs
+        lea     music_regs+7(pc),a0
+        move.b  #$3F,(a0)               ; mixer = all disabled
+
+        ; Also clear ay_regs to prevent stale SFX overlay data
+        lea     ay_regs(pc),a0
+        moveq   #13,d0
+.clr_ay:
+        clr.b   (a0)+
+        dbra    d0,.clr_ay
+        lea     ay_regs+7(pc),a0
+        move.b  #$3F,(a0)               ; mixer = all disabled
+
+        ; Clear reg13_dirty so track switch doesn't cause
+        ; a spurious envelope restart from stale reg13 data
+        lea     reg13_dirty(pc),a0
+        clr.w   (a0)
+
+        ; Set state
+        lea     music_playing(pc),a1
+        move.w  #1,(a1)
+        lea     current_music_id(pc),a1
+        move.w  d2,(a1)
+        bra.s   .init_done
+
+.bad_track:
+        ; Stop music on failure
+        lea     music_playing(pc),a0
+        clr.w   (a0)
+.init_done:
+        movem.l (sp)+,d0-d3/a0-a3
+        rts
+
+; ============================================================
+; psg_frame - Unpack one TBK frame, update music_regs
+; Called by audio_tick once per audio step (25 Hz clock) when music is playing
+; TBK decompression ported from ZX Spectrum
+; ============================================================
+psg_frame:
+        movem.l d0-d5/a0-a4,-(sp)
+
+        move.w  music_playing(pc),d0
+        tst.w   d0
+        beq     .pf_done
+
+        ; Check if pausing
+        move.w  tbk_pausing(pc),d0
+        beq.s   .do_unpack
+        subq.w  #1,d0
+        lea     tbk_pausing(pc),a0
+        move.w  d0,(a0)
+        bra     .pf_done               ; buffer unchanged during pause
+
+.do_unpack:
+        ; Reset reg13 flag for this frame
+        lea     tbk_buffer+13(pc),a0
+        move.b  #$FF,(a0)
+
+        move.l  tbk_stream(pc),a0       ; a0 = stream read position
+        lea     tbk_buffer(pc),a1       ; a1 = output buffer base
+
+        ; ======== Top-level command dispatch ========
+.tbk_dispatch:
+        moveq   #0,d0
+        move.b  (a0),d0                 ; d0 = command byte
+
+        ; Test bit 7 for command type
+        btst    #7,d0
+        bne     .cmd_1x                 ; bit7=1: replay command
+
+        ; Command 0X (bit7=0)
+        btst    #6,d0
+        bne     .cmd_01                 ; bit6=1: PSG2 bulk update
+
+        ; ======== Command 00: PSG1 / Pause / Stop ========
+        move.w  d0,d1
+        andi.w  #$3F,d1                 ; 6-bit field (bits 5-0)
+        cmpi.b  #30,d1
+        blt     .cmd_psg1              ; 0-29: register write(s)
+        beq.s   .cmd_empty             ; 30: empty frame (no register changes)
+        cmpi.b  #63,d1
+        beq.s   .cmd_stop              ; 63: stop (loop to start)
+
+        ; Pause: duration = field - 30
+        ; Subtract 31 (not 30) because this frame itself counts as one
+        subi.w  #31,d1
+        lea     tbk_pausing(pc),a2
+        move.w  d1,(a2)
+        addq.l  #1,a0                  ; advance past command byte
+        bra     .tbk_frame_done
+
+.cmd_empty:
+        addq.l  #1,a0                  ; advance past command byte
+        bra     .tbk_frame_done
+
+.cmd_stop:
+        ; Loop: reinitialize from start of track
+        move.l  tbk_loop_addr(pc),a0
+        ; Clear buffer for fresh loop
+        clr.l   (a1)
+        clr.l   4(a1)
+        clr.l   8(a1)
+        clr.l   12(a1)
+        move.b  #$3F,7(a1)             ; mixer = all disabled
+        move.b  #$FF,13(a1)            ; reg13 flag = no update
+        bra     .tbk_dispatch           ; unpack first frame of loop
+
+        ; ======== Command 00 - PSG1: 1 or 2 register writes ========
+.cmd_psg1:
+        ; d0 = command byte, low nibble = first register number
+        move.w  d0,d1
+        andi.w  #$0F,d1                ; d1 = register number
+
+        ; Write first register value
+        cmpi.b  #13,d1
+        bne.s   .psg1_wr1
+        ; Register 13: set flag + write value to slot 14
+        move.b  d1,13(a1)              ; flag = 13 (non-$FF)
+        move.b  1(a0),14(a1)           ; value to buffer[14]
+        bra.s   .psg1_check2
+.psg1_wr1:
+        move.b  1(a0),(a1,d1.w)        ; buffer[reg] = value
+
+.psg1_check2:
+        ; Check if 2-register record: byte == low nibble means high nibble is 0
+        cmp.b   d0,d1
+        bne.s   .psg1_single           ; not equal: 1 register only
+
+        ; Second register write
+        moveq   #0,d2
+        move.b  2(a0),d2               ; second indicator byte
+        andi.w  #$0F,d2                ; d2 = second register number
+        cmpi.b  #13,d2
+        bne.s   .psg1_wr2
+        move.b  d2,13(a1)              ; reg13 flag
+        move.b  3(a0),14(a1)           ; reg13 value
+        bra.s   .psg1_two_done
+.psg1_wr2:
+        move.b  3(a0),(a1,d2.w)        ; buffer[reg2] = value2
+.psg1_two_done:
+        addq.l  #4,a0                  ; advance past 4 bytes
+        bra     .tbk_frame_done
+
+.psg1_single:
+        addq.l  #2,a0                  ; advance past 2 bytes
+        bra     .tbk_frame_done
+
+        ; ======== Command 01 - PSG2: bulk register update ========
+.cmd_01:
+        ; Build 14-bit register presence mask
+        ; Bits 5-0 of command = registers 0-5 (bit5=reg0, bit0=reg5)
+        ; Next byte bits 7-0 = registers 6-13 (bit7=reg6, bit0=reg13)
+        move.w  d0,d3
+        andi.w  #$3F,d3                ; command bits 5-0
+        lsl.w   #8,d3                  ; shift to bits 13-8
+        moveq   #0,d4
+        move.b  1(a0),d4               ; second mask byte
+        or.w    d4,d3                  ; d3 = 14-bit mask
+        lsl.w   #2,d3                  ; align to bits 15-2 for shifting
+
+        lea     2(a0),a2               ; a2 = source (value bytes in stream)
+        moveq   #0,d2                  ; d2 = register counter (0-13)
+
+.cmd01_loop:
+        add.w   d3,d3                  ; shift left, MSB to carry
+        bcc.s   .cmd01_skip
+
+        ; Register d2 is present — read value
+        cmpi.b  #13,d2
+        bne.s   .cmd01_normal
+        ; Register 13 special handling
+        move.b  #0,13(a1)             ; flag = 0 (non-$FF, means "update")
+        move.b  (a2)+,14(a1)          ; value to slot 14
+        bra.s   .cmd01_next
+.cmd01_normal:
+        move.b  (a2)+,(a1,d2.w)       ; buffer[reg] = value
+.cmd01_skip:
+.cmd01_next:
+        addq.w  #1,d2
+        cmpi.w  #14,d2
+        blt.s   .cmd01_loop
+
+        move.l  a2,a0                  ; update stream pointer past all values
+        bra.s   .tbk_frame_done
+
+        ; ======== Command 1X - Replay (back-reference) ========
+.cmd_1x:
+        ; Read 14-bit offset: command bits 5-0 = high, next byte = low
+        moveq   #0,d1
+        move.b  (a0),d1
+        andi.w  #$3F,d1                ; 6-bit high offset
+        lsl.w   #8,d1
+        moveq   #0,d2
+        move.b  1(a0),d2               ; low byte of offset
+        or.w    d2,d1                  ; d1 = 14-bit offset
+
+        ; Check bit 6 for Command 10 vs Command 11
+        btst    #6,d0
+        bne.s   .cmd_11
+
+        ; Command 10: single frame replay
+        lea     2(a0),a2               ; return address = after 2-byte command
+        moveq   #1,d3                  ; frame count = 1
+        bra.s   .do_replay
+
+.cmd_11:
+        ; Command 11: multi-frame replay
+        moveq   #0,d3
+        move.b  2(a0),d3               ; frame count from stream
+        lea     3(a0),a2               ; return address = after 3-byte command
+
+.do_replay:
+        ; If already inside a replay, push outer state to stack.
+        ; This handles nested replays (replay target contains another replay).
+        tst.b   15(a1)                  ; buffer[15] = current replay counter
+        beq.s   .replay_no_push         ; 0 = not inside a replay
+
+        ; Push (tbk_prev, buffer[15]) to replay stack
+        move.w  replay_stack_depth(pc),d4
+        cmpi.w  #REPLAY_STACK_MAX,d4
+        bge.s   .replay_no_push         ; stack full, skip (safety)
+        lea     replay_stack(pc),a3
+        lsl.w   #3,d4                   ; d4 = depth * 8 (entry size)
+        move.l  tbk_prev(pc),(a3,d4.w)  ; save outer prev_pos
+        moveq   #0,d5
+        move.b  15(a1),d5
+        move.w  d5,4(a3,d4.w)           ; save outer remaining count
+        ; Increment stack depth
+        lea     replay_stack_depth(pc),a3
+        addq.w  #1,(a3)
+
+.replay_no_push:
+        ; Save return address
+        lea     tbk_prev(pc),a3
+        move.l  a2,(a3)
+
+        ; Save frame count in buffer[15]
+        move.b  d3,15(a1)
+
+        ; Back-reference: target = command_addr - offset
+        move.l  a0,a3
+        moveq   #0,d4
+        move.w  d1,d4
+        suba.l  d4,a3                  ; a3 = target address
+        move.l  a3,a0                  ; read from target
+
+        ; Dispatch command at target (may itself be a replay → nesting)
+        bra     .tbk_dispatch
+
+        ; ======== Frame done — bookkeeping ========
+.tbk_frame_done:
+        ; Save current stream position
+        lea     tbk_stream(pc),a2
+        move.l  a0,(a2)
+
+        ; Check replay frame counter
+        move.b  15(a1),d0              ; buffer[15] = replay frames
+        beq.s   .tbk_copy              ; 0 = no replay active
+
+        subq.b  #1,d0
+        move.b  d0,15(a1)
+        bne.s   .tbk_copy              ; more frames remaining
+
+        ; Replay finished: restore saved stream position
+        move.l  tbk_prev(pc),a0
+        lea     tbk_stream(pc),a2
+        move.l  a0,(a2)
+
+        ; Unwind replay stack (handle nested replays)
+        bsr     .replay_unwind
+
+.tbk_copy:
+        ; Sanitize mixer register (bits 7-6 must be 0)
+        andi.b  #$3F,7(a1)
+
+        ; Copy tbk_buffer to music_regs
+        lea     tbk_buffer(pc),a2
+        lea     music_regs(pc),a3
+
+        ; Registers 0-11 (3 longwords)
+        move.l  (a2),(a3)
+        move.l  4(a2),4(a3)
+        move.l  8(a2),8(a3)
+        ; Register 12
+        move.b  12(a2),12(a3)
+
+        ; Register 13: only update if flag != $FF
+        move.b  13(a2),d0              ; flag byte
+        cmpi.b  #$FF,d0
+        beq.s   .pf_done
+        move.b  14(a2),13(a3)          ; copy reg13 value
+        ; Flag reg 13 as needing a real hardware write this frame
+        lea     reg13_dirty(pc),a4
+        move.w  #1,(a4)
+
+.pf_done:
+        movem.l (sp)+,d0-d5/a0-a4
+        rts
+
+; Unwind nested replay stack after a replay finishes.
+; Called from .tbk_frame_done when buffer[15] reaches 0.
 ;
-; To use: After init completes, load music data starting at
-; the address of 'reclaimable_start' (bg1_left label).
+; On entry: tbk_stream already contains restored prev_pos.
+; Modifies: d4, d5, a3, a4 (saved/restored by psg_frame's movem).
+.replay_unwind:
+        move.w  replay_stack_depth(pc),d4
+        beq.s   .ru_done                ; stack empty, nothing to unwind
+
+.ru_loop:
+        ; Pop top entry: decrement depth
+        subq.w  #1,d4
+
+        ; Calculate entry byte offset = depth * 8
+        lea     replay_stack(pc),a3
+        move.w  d4,d5
+        lsl.w   #3,d5                   ; d5 = byte offset into stack
+
+        ; Read entry: +0 = outer_prev_pos (long), +4 = outer_remaining (word)
+        move.l  (a3,d5.w),a4           ; a4 = outer_prev_pos
+        move.w  4(a3,d5.w),d5         ; d5 = outer_remaining
+
+        ; This frame counted for the outer replay too
+        subq.w  #1,d5
+        ble.s   .ru_also_done           ; outer replay also finished (<=0)
+
+        ; outer_remaining > 0: restore as the active replay
+        lea     tbk_prev(pc),a3
+        move.l  a4,(a3)                ; tbk_prev = outer_prev_pos
+        lea     tbk_buffer(pc),a3
+        move.b  d5,15(a3)              ; buffer[15] = outer_remaining
+        bra.s   .ru_done               ; stop unwinding
+
+.ru_also_done:
+        ; Outer replay also exhausted: restore stream to its return address
+        lea     tbk_stream(pc),a3
+        move.l  a4,(a3)                ; tbk_stream = outer_prev_pos
+        ; Continue unwinding if more entries remain on stack
+        tst.w   d4
+        bgt.s   .ru_loop
+
+.ru_done:
+        ; Store updated stack depth
+        lea     replay_stack_depth(pc),a3
+        move.w  d4,(a3)
+        rts
+
 ; ============================================================
-reclaimable_start:
+; music_start - D0.w = track ID.  Decode the packed track into music_buf
+; and start it; the same track already playing is left alone.  Main-line
+; code only (level load, outro): the decode takes ~0.1-0.2 s with POLLs, so
+; the clock keeps counting; audio_tick sees music_playing = 0 meanwhile and
+; only steps the SFX.  QSound only.  All registers preserved.
+; ============================================================
+music_start:
+        movem.l d0-d2/a0-a1,-(sp)
+        move.w  qsound_mode(pc),d1
+        cmpi.w  #QSND_VECTOR,d1
+        bne.s   .out
+        cmpi.w  #NUM_TRACKS,d0
+        bhs.s   .out
+        cmp.w   current_music_id(pc),d0
+        bne.s   .new
+        move.w  music_playing(pc),d1
+        bne.s   .out                    ; already playing
+.new:   lea     music_playing(pc),a0
+        clr.w   (a0)                    ; the tick only steps SFX now
+        move.l  d0,-(sp)
+        bsr     ay_silence
+        move.l  (sp)+,d0
+        lea     music_tracks(pc),a0
+        move.w  d0,d1
+        lsl.w   #2,d1
+        move.w  2(a0,d1.w),d2           ; raw length
+        adda.w  0(a0,d1.w),a0           ; packed data
+        lea     music_buf(pc),a1
+        move.l  a2,-(sp)
+        movea.l otz_decode_ptr(pc),a2   ; too far for bsr
+        jsr     (a2)
+        movea.l (sp)+,a2
+        bsr     psg_init                ; sets music_playing = 1
+.out:   movem.l (sp)+,d0-d2/a0-a1
+        rts
 
-; Side image data (generated from pl1.png, 60x133, QL MODE 8)
-; Right side is mirrored from left at runtime (see draw_side_images)
-bg1_left:
-        incbin  "pl1_left.bin"
+        ifnd NOMUSIC
+        ifd MUSIC_ONE
+        include "music_one.inc"
+        else
+        ifd MUSIC50
+        even                            ; buffer first: lea music_buf(pc) reach
+music_buf:      ds.b    15014           ; TEST: largest 50 Hz track
+        include "music50.inc"           ; TEST: 50 Hz tracks (>128K)
+        ifne MUSIC_BUF_SIZE-15014
+        fail "music_buf size"
+        endif
+        else
+        include "music_otz.inc"
+        endif
+        endif
+        else
+NUM_TRACKS      equ 0
+MUSIC_BUF_SIZE  equ 2
+music_tracks:
+        endif
         even
+        ifnd MUSIC50
+music_buf:      ds.b    MUSIC_BUF_SIZE  ; the playing track, decoded
+        endif
 
-; mirror_lut - 256-byte lookup table for reversing 4 pixels in a byte
-; Each byte has 4 x 2-bit fields: ABCDEFGH -> GHEFCDAB
-; entry[i] = ((i&$03)<<6) | ((i&$0C)<<2) | ((i&$30)>>2) | ((i&$C0)>>6)
-mirror_lut:
-        dc.b    $00,$40,$80,$C0,$10,$50,$90,$D0,$20,$60,$A0,$E0,$30,$70,$B0,$F0
-        dc.b    $04,$44,$84,$C4,$14,$54,$94,$D4,$24,$64,$A4,$E4,$34,$74,$B4,$F4
-        dc.b    $08,$48,$88,$C8,$18,$58,$98,$D8,$28,$68,$A8,$E8,$38,$78,$B8,$F8
-        dc.b    $0C,$4C,$8C,$CC,$1C,$5C,$9C,$DC,$2C,$6C,$AC,$EC,$3C,$7C,$BC,$FC
-        dc.b    $01,$41,$81,$C1,$11,$51,$91,$D1,$21,$61,$A1,$E1,$31,$71,$B1,$F1
-        dc.b    $05,$45,$85,$C5,$15,$55,$95,$D5,$25,$65,$A5,$E5,$35,$75,$B5,$F5
-        dc.b    $09,$49,$89,$C9,$19,$59,$99,$D9,$29,$69,$A9,$E9,$39,$79,$B9,$F9
-        dc.b    $0D,$4D,$8D,$CD,$1D,$5D,$9D,$DD,$2D,$6D,$AD,$ED,$3D,$7D,$BD,$FD
-        dc.b    $02,$42,$82,$C2,$12,$52,$92,$D2,$22,$62,$A2,$E2,$32,$72,$B2,$F2
-        dc.b    $06,$46,$86,$C6,$16,$56,$96,$D6,$26,$66,$A6,$E6,$36,$76,$B6,$F6
-        dc.b    $0A,$4A,$8A,$CA,$1A,$5A,$9A,$DA,$2A,$6A,$AA,$EA,$3A,$7A,$BA,$FA
-        dc.b    $0E,$4E,$8E,$CE,$1E,$5E,$9E,$DE,$2E,$6E,$AE,$EE,$3E,$7E,$BE,$FE
-        dc.b    $03,$43,$83,$C3,$13,$53,$93,$D3,$23,$63,$A3,$E3,$33,$73,$B3,$F3
-        dc.b    $07,$47,$87,$C7,$17,$57,$97,$D7,$27,$67,$A7,$E7,$37,$77,$B7,$F7
-        dc.b    $0B,$4B,$8B,$CB,$1B,$5B,$9B,$DB,$2B,$6B,$AB,$EB,$3B,$7B,$BB,$FB
-        dc.b    $0F,$4F,$8F,$CF,$1F,$5F,$9F,$DF,$2F,$6F,$AF,$EF,$3F,$7F,$BF,$FF
+        ifd PROFILE
+        ifnd NOMUSIC
+        ifnd MUSIC_ONE
+; ----------------------------------------------------------------------------
+; Music check log (profile builds with music): one 16-byte record per audio
+; step - music_regs (14), track id, playing flag - for tools/otmus.py, which
+; replays the tracks through a reference TBK decoder.  prof_mus_steps counts
+; every step, to check the step rate against the clock (= ticks / 2).
+; ----------------------------------------------------------------------------
+MLOG_MAX        equ     3000
+prof_mus_steps: dc.l    0
+prof_mus_n:     dc.w    0
+prof_mus_rec:
+        movem.l d0/a0-a1,-(sp)
+        lea     prof_mus_steps(pc),a0
+        addq.l  #1,(a0)
+        moveq   #0,d0
+        move.w  prof_mus_n(pc),d0
+        cmpi.w  #MLOG_MAX,d0
+        bhs.s   .full
+        lea     prof_mus_n(pc),a0
+        addq.w  #1,(a0)
+        lsl.l   #4,d0
+        lea     prof_mlog(pc),a1
+        adda.l  d0,a1
+        lea     music_regs(pc),a0
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.w  (a0)+,(a1)+
+        move.b  current_music_id+1(pc),(a1)+
+        move.b  music_playing+1(pc),(a1)+
+.full:  movem.l (sp)+,d0/a0-a1
+        rts
         even
+prof_mlog_hdr:  ds.b    16              ; 'OTML', n.w, steps.l, clock.w
+prof_mlog:      ds.b    MLOG_MAX*16
+        endif
+        endif
+        endif
 
-reclaimable_end:
-; Total reclaimable: reclaimable_end - reclaimable_start = 4246 bytes
+        ifd PROFILE
+        even
+prof_log_hdr:   ds.b    32
+prof_log:       ds.b    PROF_MAXREC*PROF_RECSZ
+        endif
 
 ; ============================================================
 ; End of Old Tower - 128KB Edition

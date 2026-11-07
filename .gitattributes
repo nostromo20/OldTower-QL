@@ -1,0 +1,6 @@
+boot text eol=lf
+*.s text eol=lf
+*.inc text eol=lf
+*.otz binary
+*.bin binary
+*.afb binary

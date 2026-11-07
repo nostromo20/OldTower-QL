@@ -1,4 +1,3 @@
-
           ___  _     ____    _____  ___  _    _ _____ ____
          / _ \| |   |  _ \  |_   _|/ _ \| |  | | ____|  _ \
         | | | | |   | | | |   | | | | | | |  | |  _| | |_) |
@@ -9,7 +8,7 @@
                        SINCLAIR QL CONVERSION
               ============================================
 
-                         - RELEASE 2026 -
+                         - VERSION 2.0 -
 
          An unofficial conversion of the ZX Spectrum classic
                     for the Sinclair QL computer
@@ -53,57 +52,92 @@
 
    * All 21 original levels
    * Full colour graphics with smooth vertical scrolling
-   * QSound AY chip audio (music + sound effects)
-   * IPC beeper fallback for systems without QSound
-   * Automatic frame rate detection (25fps/50fps)
-   * Two editions: Standard (SFX only) and Large Memory (full music)
+   * Steady 25 frames per second on a standard 128K QL
+   * QSound AY chip music and sound effects - now on a standard 128K QL
+   * IPC beeper sound effects for systems without QSound
+   * Controls page on the title screen (press ENTER)
 
 
  ============================================================================
-                              EDITIONS
+                          WHAT'S NEW IN 2.0
  ============================================================================
 
- STANDARD EDITION (OldTower)
- ---------------------
- Binary: OldTower (~57KB)
+ * ONE EDITION. The Standard and Large Memory editions are replaced by a
+   single game that runs on any 128K QL. With QSound you get the full
+   music and sound effects; without it, beeper sound effects.
 
- Sound effects via QSound or IPC beeper. Runs on any 128KB QL system.
- Recommended for real hardware with limited memory expansion.
+ * MUSIC ON 128K. The five music tracks and the levels are now packed, so
+   the music fits in a standard 128K machine alongside the game.
+
+ * STEADY TIMING. The music keeps time with the QL's 50Hz display clock
+   rather than the game's frame rate, so it never drifts or slows down
+   when the action gets busy.
+
+ * FASTER. Screen drawing, the keyboard and the sound have been optimised:
+   the game now holds 25 frames per second on a standard 128K QL almost
+   all of the time. With expansion memory it runs even more smoothly.
+
+ * LOUDER SOUND EFFECTS on QSound.
+
+ * NEW CONTROLS PAGE. Press ENTER on the title screen to see the keys.
+
+ * NEW KEYS. Movement is now on the cursor keys (or joystick) only, and
+   ENTER restarts the level. See CONTROLS below.
 
 
- LARGE MEMORY EDITION (OldTower_M)
- --------------------------
- Binary: OldTower_M (~110KB) : Fits on a Microdrive!!!
+ ============================================================================
+                              REQUIREMENTS
+ ============================================================================
 
- Full music and sound effects. Features five compressed music tracks
- that match the original ZX Spectrum 128K experience. Requires 256KB
- QL or expanded system. Recommended for emulators or expanded QLs.
+ * Sinclair QL with 128K or more. No Toolkit II needed.
+ * QSound (optional) for music and AY sound effects.
+ * Expansion memory (optional) makes the game run more smoothly.
+
+ Emulators: in Q-emuLator, turn QSound on in the settings for music. With
+ QSound, use up to 640K of memory - larger settings clash with QSound's
+ memory address.
 
 
  ============================================================================
                                LOADING
  ============================================================================
 
- OQDOS executable:
+ The game is two files: boot (the loader) and oldtower (the game).
 
-   EXEC_W mdv1_OldTower   
+ With the cartridge in mdv1_, reset the QL and press F1 or F2: the game
+ loads by itself. Or type:
+
+   LRUN mdv1_boot
+
+ The boot loader reserves memory, loads the game and starts it. To load
+ from another drive, change the dev$ line in boot, for example:
+
+   120 dev$="flp1_"
+
+ ESC on the title screen quits back to SuperBASIC.
+
 
  ============================================================================
                               CONTROLS
  ============================================================================
 
-      MOVEMENT:           Q = UP      A = DOWN
-                          O = LEFT    P = RIGHT
+      MOVEMENT:           CURSOR KEYS  (or joystick 1)
 
-                    - or use CURSOR KEYS -
+      SWAP HEROES:        SPACE        (or joystick fire)
 
-      SWAP HEROES:        SPACE
-
-      RESET LEVEL:        R
+      RESTART LEVEL:      ENTER        (costs a life)
 
       RETURN TO TITLE:    ESC
 
-      QUIT GAME:          ESC (from title screen)
+   On the title screen:
+
+      START GAME:         SPACE        (or joystick fire)
+
+      CONTROLS PAGE:      ENTER
+
+      QUIT GAME:          ESC
+
+ Players of version 1.x: Q/A/O/P and R are no longer used.
 
 
  ============================================================================
@@ -154,12 +188,27 @@
                            TECHNICAL NOTES
  ============================================================================
 
- * Requires 128KB QL or expanded system
- * Runs in MODE 8 (256x256, 8 colours)
- * Uses QSound ROM for AY-3-8910 sound chip emulation
- * Falls back to IPC beeper if QSound not available
- * Auto-detects 50fps or 25fps display timing
- * Large Memory Edition uses TBK compressed music format
+ * Runs on a standard 128K QL (tested with the JS ROM)
+ * MODE 8 (256x256, 8 colours), 25 frames per second
+ * Takes over the machine while playing: interrupts are off and the game
+   keeps its own time from the 50Hz display signal
+ * Uses QSound for AY-3-8910 music and sound effects; falls back to the
+   IPC beeper if QSound is not available
+ * Music: TBK format tracks, packed with a custom LZ compressor and
+   unpacked one track at a time
+
+
+ ============================================================================
+                               SOURCE
+ ============================================================================
+
+ OldTower.s is the game. It includes ot_polled.s and the packed data files
+ (levels_otz.inc, music_otz.inc, *.otz, tomba_25hz.afb, pl1_left.bin).
+ Assemble with vasm (68000, plain binary):
+
+   vasmm68k_mot -Fbin -m68000 -no-opt -DPOLLED=1 -o oldtower OldTower.s
+
+ Leave out -DPOLLED=1 for a version timed by QDOS (QPC2 / SMSQ/E).
 
 
  ============================================================================

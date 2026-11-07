@@ -1,3 +1,40 @@
+# Old Tower v2.0 Changelog
+
+**Changes from Old Tower v1.2 to v2.0**
+
+## One Edition
+- The Standard and Large Memory (music) editions are merged into one game for a standard 128K QL. With QSound it plays the full music and AY sound effects; without QSound it uses beeper sound effects.
+- Init-only data (expanded tiles, side images, mirror table) now lives inside the playfield buffer's space and is overwritten once the game starts.
+- Levels and music tracks are packed with OTZ, a bit-level LZ format (`otz_decode`), replacing the RLE level data. Tracks are unpacked one at a time into a single buffer when the music changes.
+
+## Timing
+- New polled mode (default build): the game runs with interrupts off and keeps its own 50Hz clock from the display frame signal (`poll_tick`).
+- Music and sound effects step on that fixed clock (every second tick, 25Hz) instead of once per game frame, so the music never drifts or slows down when frames run long.
+- A QDOS-timed build (assembled without `POLLED`) remains for QPC2 / SMSQ/E; it catches up audio steps from the QDOS tick.
+
+## Performance
+- Fully unrolled 12-register screen copy, persistent trails and bats (no save/restore), score digit table and cache, coin tiles held in registers.
+- Keyboard read directly through the IPC, one row only; the row is read every frame when the hero is standing still and every second frame while moving.
+- On a standard 128K QL, frames over the 40ms budget are now rare (about 0.2%); with expansion memory there are none.
+
+## Controls
+- Cursor keys (or joystick 1) to move, SPACE (fire) to swap heroes, ENTER to restart the level (costs a life), ESC back to the title / quit.
+- Q/A/O/P and R are no longer used.
+- New controls page: press ENTER on the title screen.
+
+## Sound
+- Sound effects on QSound play at full volume (previously scaled to 75%).
+
+## Loading and Exit
+- New `boot` loader (RESPR + LBYTES + CALL); no Toolkit II needed. Change `dev$` in `boot` to load from another drive.
+- Quitting returns cleanly to SuperBASIC (previously ended with a "not complete" message).
+
+## Visual
+- Title screen shows "v2.0" and "ENTER FOR KEYS".
+
+## Removed
+- Unused routines: level number display, buffer-composited bullets.
+
 # Old Tower v1.2 — Music Edition Changelog
 
 **Changes from Old Tower v1.0 (Music Edition) to v1.2**
